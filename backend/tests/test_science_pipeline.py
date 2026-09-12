@@ -11,10 +11,11 @@ from unittest.mock import Mock, patch
 
 from backend.app import aliyun_speech, science_content, store
 from backend.app.agent_scene_code import scene_code_fingerprint, validate_scene_code, validate_scene_code_set
-from backend.app.ingest import build_audio_scene_seed, build_subtitle_cues, infer_semantic_motion, segment_script_for_tts
+from backend.app.ingest import build_audio_scene_seed, build_subtitle_cues, concatenate_audio, infer_semantic_motion, segment_script_for_tts
 from backend.app.jiuwen_team import normalize_creative_plan
 from backend.app.managed_faceless_builder import apply_creative_plan, render_agent_scene_markup, render_semantic_science_markup
 from backend.app.single_agent import SingleAgentRunner
+from backend.app.two_stage_core import _caption_template, _host
 
 
 def wav_bytes(duration_s: float = 0.25) -> bytes:
@@ -61,6 +62,21 @@ class SciencePipelineTests(unittest.TestCase):
         with patch.dict("os.environ", {"FRAMECRAFT_ALLOW_PROJECT_LIST": ""}, clear=False):
             response = TestClient(app).get("/api/projects")
         self.assertEqual(response.status_code, 404)
+
+    def test_two_stage_captions_mount_on_top_layer(self):
+        cues = [{"index": 1, "start": 0, "end": 1.2, "text": "字幕必须在最上层"}]
+        captions = _caption_template(cues, 1920, 1080, 3.0)
+        host = _host(
+            {
+                "project": {"width": 1920, "height": 1080, "total_duration_s": 3.0},
+                "pages": [{"page_id": "page-01", "duration_s": 3.0}],
+            },
+            "source_audio.wav",
+            cues,
+        )
+        self.assertIn("z-index:2147483647", captions)
+        self.assertIn('data-track-index="9999"', host)
+        self.assertIn("isolation:isolate", host)
 
     def test_chat_before_first_render_asks_for_initial_generation(self):
         state = {
@@ -448,17 +464,29 @@ class SciencePipelineTests(unittest.TestCase):
             self.assertEqual(result["text"], "光在大气中发生散射。")
             self.assertEqual(result["provider"], "aliyun-bailian")
 
-    @patch.object(science_content, "_probe_public_url", return_value="https://example.org/source")
+    def test_tts_concat_inserts_short_sentence_pause(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            part_a = root / "a.wav"
+            part_b = root / "b.wav"
+            part_a.write_bytes(wav_bytes(0.25))
+            part_b.write_bytes(wav_bytes(0.25))
+            output = root / "merged.wav"
+            concatenate_audio([part_a, part_b], output, pause_s=0.3)
+            duration = aliyun_speech.probe_duration_s(output)
+            self.assertGreater(duration, 0.72)
+            self.assertLess(duration, 0.9)
+
     @patch.object(science_content, "deepseek_settings", return_value={"pro_model": "deepseek-v4-pro"})
     @patch.object(science_content, "create_client")
-    def test_topic_mode_creates_structured_brief(self, client: Mock, _settings: Mock, _probe: Mock):
-        content = '{"title":"蓝天的颜色","audience":"大众","takeaway":"理解散射","chapters":[{"title":"现象","narration":"抬头看天空，它通常呈现蓝色。","visual_claim":"阳光进入大气","motion":"system","evidence_ids":["S1"]},{"title":"路径","narration":"不同颜色的光会经历不同程度的散射。","visual_claim":"短波更易散开","motion":"mechanism","evidence_ids":["S1"]},{"title":"结论","narration":"我们看到的蓝光来自四面八方。","visual_claim":"散射光进入眼睛","motion":"system","evidence_ids":[]}],"sources":[{"id":"S1","claim":"散射","organization":"示例机构","page":"来源页","url":"https://example.org/source"}]}'
+    def test_topic_mode_creates_structured_brief(self, client: Mock, _settings: Mock):
+        content = '{"title":"蓝天的颜色","audience":"大众","takeaway":"理解散射","chapters":[{"title":"现象","narration":"抬头看天空，它通常呈现蓝色。","visual_claim":"阳光进入大气","motion":"system","evidence_ids":[]},{"title":"路径","narration":"不同颜色的光会经历不同程度的散射。","visual_claim":"短波更易散开","motion":"mechanism","evidence_ids":[]},{"title":"结论","narration":"我们看到的蓝光来自四面八方。","visual_claim":"散射光进入眼睛","motion":"system","evidence_ids":[]}],"sources":[]}'
         client.return_value.chat.completions.create.return_value = SimpleNamespace(
             choices=[SimpleNamespace(message=SimpleNamespace(content=content))]
         )
         brief = science_content.generate_science_brief("天空为什么是蓝色", "面向大众", 45)
         self.assertEqual(len(brief["chapters"]), 3)
-        self.assertTrue(brief["sources"][0]["url_verified"])
+        self.assertEqual(brief["sources"], [])
 
     @patch.object(science_content, "deepseek_settings", return_value={"pro_model": "deepseek-v4-pro"})
     @patch.object(science_content, "create_client")

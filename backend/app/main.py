@@ -16,7 +16,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 from . import store
-from .ingest import ensure_version_subtitles, read_script_text, write_script_text
+from .ingest import ensure_version_subtitles, read_script_text, script_file_path, write_script_text
 from .retention import startup_prune_if_enabled
 from .security import cors_origin_regex, cors_origins
 from .single_agent import ProjectBusyError, runner
@@ -228,6 +228,35 @@ def list_assets(project_id: str):
 def get_script(project_id: str):
     project = _ensure_project(project_id)
     return {"text": read_script_text(project)}
+
+
+@app.get("/api/projects/{project_id}/source/script-file")
+def get_script_file(project_id: str):
+    _ensure_project(project_id)
+    path = script_file_path(project_id)
+    if not path.is_file():
+        raise HTTPException(404, "讲稿文件尚未生成。")
+    return _project_file_response(project_id, path, "text/plain; charset=utf-8", "script.txt")
+
+
+@app.get("/api/projects/{project_id}/source/audio")
+def get_source_audio(project_id: str):
+    _ensure_project(project_id)
+    bundle_path = store.project_dir(project_id) / "input" / "source_bundle.json"
+    audio_path = store.project_dir(project_id) / "input" / "source_audio.wav"
+    if bundle_path.is_file():
+        try:
+            bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
+            candidate = Path(str(bundle.get("source_audio_path") or ""))
+            if candidate.is_file():
+                audio_path = candidate
+        except Exception:
+            audio_path = store.project_dir(project_id) / "input" / "source_audio.wav"
+    if not audio_path.is_file():
+        raise HTTPException(404, "声音文件尚未生成。")
+    suffix = audio_path.suffix.lower() or ".wav"
+    media_type = mimetypes.guess_type(f"source_audio{suffix}")[0] or "audio/wav"
+    return _project_file_response(project_id, audio_path, media_type, f"source_audio{suffix}")
 
 
 @app.put("/api/projects/{project_id}/script")
@@ -454,15 +483,6 @@ def version_subtitles(project_id: str, version_id: str):
     path = Path(version["version_dir"]) / "subtitles.srt"
     ensure_version_subtitles(project_id, Path(version["version_dir"]))
     return _file_or_json(path, "")
-
-
-@app.get("/api/projects/{project_id}/versions/{version_id}/source-ledger")
-def version_source_ledger(project_id: str, version_id: str):
-    version = _version(project_id, version_id)
-    path = Path(version["version_dir"]) / "SOURCE_LEDGER.md"
-    if path.is_file():
-        return FileResponse(path, media_type="text/markdown; charset=utf-8", filename="SOURCE_LEDGER.md")
-    raise HTTPException(404, "该版本没有外部数据来源台账。")
 
 
 @app.get("/api/projects/{project_id}/versions/{version_id}/hyperframes")
@@ -727,3 +747,12 @@ def _file_or_json(path: Path, fallback: Any):
     if path.is_file():
         return FileResponse(path)
     return JSONResponse(fallback)
+
+
+def _project_file_response(project_id: str, path: Path, media_type: str | None = None, filename: str | None = None):
+    resolved = path.resolve()
+    project_root = store.project_dir(project_id).resolve()
+    upload_root = store.upload_dir(project_id).resolve()
+    if not (resolved.is_relative_to(project_root) or resolved.is_relative_to(upload_root)):
+        raise HTTPException(403, "文件不属于当前项目。")
+    return FileResponse(resolved, media_type=media_type, filename=filename or resolved.name)

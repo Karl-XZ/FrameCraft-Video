@@ -6,12 +6,11 @@ FrameCraft-CN 把一个科普主题、一篇中文文案或一段音视频，转
 
 ## 功能
 
-- 输入主题：DeepSeek 自动生成科普讲稿、章节、视觉主张和来源台账，再调用阿里云 TTS。
+- 输入主题：DeepSeek 自动生成科普讲稿、章节和视觉主张，再调用阿里云 TTS。
 - 输入文案：严格按照用户原文生成阿里云 TTS、字幕和视频，不改写正文。
 - 上传媒体：阿里云 ASR 转写音频或视频原音轨；最终成片完整使用原音频，不重新配音。
 - 多 Agent 设计与编码：内容、视觉、时序专家并行调研，总导演建立艺术圣经，每幕由独立 Agent 直接编写 SVG、HTML、CSS 与 GSAP，独立代码审查 Agent 验收后再整合。
 - 原创语义动画：逐幕源码必须针对当前内容建立独立构图，并包含入场、持续演化和退场；旧成片模板、固定母题换字和近似重复代码会被拒绝。
-- 固定来源标注：引用短注始终位于画布左下角安全位，不跟随场景构图漂移。
 - 真实 HyperFrames：浏览器调用 HyperFrames 官方 runtime 确定性逐帧渲染，并通过 WebCodecs 输出 H.264/AAC MP4。
 - 双重验收：浏览器检查编码能力、时长与音视频轨，DeepSeek 视觉模型逐幕检查入场、中段、退场三帧。
 - 项目隔离：每个项目拥有独立素材、聊天、Agent 跟踪、工程和版本记录。
@@ -32,7 +31,7 @@ FrameCraft-CN 把一个科普主题、一篇中文文案或一段音视频，转
 
 | 模式 | 用户输入 | 内容边界 | 声音来源 |
 | --- | --- | --- | --- |
-| 主题 | 主题、受众、额外要求 | DeepSeek 生成讲稿并核验来源链接 | 阿里云 Qwen3 TTS |
+| 主题 | 主题、受众、额外要求 | DeepSeek 生成讲稿和视觉主张，不联网、不伪造来源 | 阿里云 Qwen3 TTS |
 | 文案 | 完整演讲稿 | 保持原文字序和内容，只按标点分段 | 阿里云 Qwen3 TTS |
 | 媒体 | 音频或含音轨的视频 | 阿里云 ASR 转写，视觉严格跟随原音频 | 用户原音频 |
 
@@ -43,7 +42,7 @@ FrameCraft-CN 把一个科普主题、一篇中文文案或一段音视频，转
 ```text
 React 网页工作台
   -> FastAPI 项目、素材、任务和聊天 API
-  -> 主题：DeepSeek 讲稿与来源 / 文案：原文 / 媒体：阿里云 ASR
+  -> 主题：DeepSeek 讲稿与视觉主张 / 文案：原文 / 媒体：阿里云 ASR
   -> 文本输入使用阿里云 Qwen3 TTS
   -> openJiuwen TeamRuntime
        -> narrative：科学叙事与信息层级
@@ -54,7 +53,7 @@ React 网页工作台
        -> scene_code_reviewer_N：逐幕检查语义、原创性、安全边界和可执行性
        -> code_director：DeepSeek Pro 统一文字层级与连续性，不覆盖逐幕源码
        -> quality_critic：检查科学表达、场景差异和动态图形质量，不通过则触发一次完整修订
-  -> 原样整合逐幕 Agent 源码，生成 HyperFrames HTML、时间线、字幕和来源台账
+  -> 原样整合逐幕 Agent 源码，生成 HyperFrames HTML、时间线和字幕
   -> 浏览器下载 HyperFrames 工程包并安全解包到内存
   -> HyperFrames 官方 runtime renderSeek 逐帧渲染
   -> 浏览器 WebCodecs 编码 H.264/AAC + 临时联系表视觉验收
@@ -160,7 +159,7 @@ export FRAMECRAFT_RENDER_TARGET=local
 - 机制、尺度、对比、时间线和系统关系使用不同主视觉结构。
 - 关键节点逐个出现，并具有表达含义的持续运动。
 - 主视觉充分利用画幅，避免拥挤、遮挡与无意义空白。
-- HyperFrames 必须通过官方 runtime 的确定性 `renderSeek` 逐帧运行；视觉评分低于 82 时不登记通过版本。
+- HyperFrames 必须通过官方 runtime 的确定性 `renderSeek` 逐帧运行；严格视觉验收低于系统阈值时不登记最终通过版本。
 - 验收失败后保留本机可播放成片，在 Agent 对话中展示分数和问题；系统不会自动重画，只有用户明确说“重试”或点击“重试”按钮才把验收意见反馈给提示词 AI 并生成新版本。
 - 如果浏览器根本没有生成可播放 MP4，系统会把错误自动反馈给提示词 AI 修复工程，最多 3 次；超过上限后回到聊天说明问题。
 - 初版后对话改片由对话 AI 分流：完整重新生成交给提示词 AI，局部微调由对话 AI 修改现有工程文件。
@@ -200,7 +199,7 @@ backend/venv-openjiuwen/bin/python scripts/run_science_ui_flow.py \
 ```text
 outputs/<project_id>/
   analysis/analysis.json, edit_plan.json, creative_plan.json, agent_trace.json
-  input/scene_seed.json, source_bundle.json, transcript.txt, SOURCE_LEDGER.md
+  input/scene_seed.json, source_bundle.json, transcript.txt, source_audio.wav
   <version_id>/subtitles.srt, timeline.json, agent_visual_review.json
   <version_id>/local_render_manifest.json, hyperframes/, hyperframes_project.zip
 ```

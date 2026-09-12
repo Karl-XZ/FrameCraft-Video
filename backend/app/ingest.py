@@ -6,13 +6,17 @@ import math
 import re
 import shutil
 import subprocess
+import wave
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from . import store
 from .aliyun_speech import probe_duration_s, synthesize_speech, transcribe_audio_cloud
-from .science_content import generate_science_brief, write_source_ledger
+from .science_content import generate_science_brief
+
+
+TTS_SEGMENT_PAUSE_S = 0.3
 
 
 @dataclass
@@ -103,13 +107,9 @@ def prepare_topic_source(project_id: str, project: dict[str, Any], source_dir: P
             str(project.get("requirements") or ""),
             int(project.get("target_duration") or 60),
         )
+        brief["sources"] = []
         brief_path.write_text(json.dumps(brief, ensure_ascii=False, indent=2), encoding="utf-8")
-        write_source_ledger(source_dir / "SOURCE_LEDGER.md", brief)
-    source_map = {
-        str(item.get("id") or ""): item
-        for item in brief.get("sources") or []
-        if str(item.get("url") or "").startswith("https://")
-    }
+    brief["sources"] = []
     segments = [
         {
             "title": str(item.get("title") or f"第{idx}章"),
@@ -117,7 +117,7 @@ def prepare_topic_source(project_id: str, project: dict[str, Any], source_dir: P
             "visual_claim": str(item.get("visual_claim") or ""),
             "motion": str(item.get("motion") or "mechanism"),
             "evidence_ids": list(item.get("evidence_ids") or []),
-            "evidence_sources": [source_map[source_id] for source_id in item.get("evidence_ids") or [] if source_id in source_map],
+            "evidence_sources": [],
         }
         for idx, item in enumerate(brief.get("chapters") or [], start=1)
         if normalize_script_text(str(item.get("narration") or ""))
@@ -171,7 +171,12 @@ def _prepare_synthesized_source(
     meta_path = source_dir / "source_bundle.json"
     if all(path.is_file() for path in (source_audio, transcript_path, seed_path, meta_path)):
         cached = json.loads(meta_path.read_text(encoding="utf-8"))
-        if cached.get("script_sha256") == script_sha256 and cached.get("mode") == mode:
+        cached_pause = float((cached.get("tts") or {}).get("segment_pause_s") or 0)
+        if (
+            cached.get("script_sha256") == script_sha256
+            and cached.get("mode") == mode
+            and abs(cached_pause - TTS_SEGMENT_PAUSE_S) < 0.001
+        ):
             return PreparedSource(
                 mode=mode,
                 source_dir=source_dir,
@@ -188,11 +193,14 @@ def _prepare_synthesized_source(
     words: list[dict[str, Any]] = []
     scene_seed_items: list[dict[str, Any]] = []
     cursor = 0.0
+    segment_count = len(segments)
     for idx, segment in enumerate(segments, start=1):
         narration = normalize_script_text(str(segment.get("narration") or ""))
         part = tts_dir / f"scene_{idx:02d}.wav"
         meta = synthesize_speech(narration, part)
         duration = probe_duration_s(part)
+        pause_after = TTS_SEGMENT_PAUSE_S if idx < segment_count else 0.0
+        scene_duration = duration + pause_after
         segment_words = make_pseudo_timed_words(narration, duration)
         for word in segment_words:
             words.append({**word, "id": f"w{len(words)}", "start": round(word["start"] + cursor, 3), "end": round(word["end"] + cursor, 3)})
@@ -201,8 +209,8 @@ def _prepare_synthesized_source(
                 "sceneNumber": idx,
                 "sceneId": f"scene_{idx}",
                 "start_s": round(cursor, 3),
-                "end_s": round(cursor + duration, 3),
-                "duration_s": round(duration, 3),
+                "end_s": round(cursor + scene_duration, 3),
+                "duration_s": round(scene_duration, 3),
                 "transcript": narration,
                 "word_count": len(segment_words),
                 "words": words[-len(segment_words):] if segment_words else [],
@@ -215,8 +223,8 @@ def _prepare_synthesized_source(
         )
         audio_parts.append(part)
         tts_segments.append(meta)
-        cursor += duration
-    concatenate_audio(audio_parts, source_audio)
+        cursor += scene_duration
+    concatenate_audio(audio_parts, source_audio, pause_s=TTS_SEGMENT_PAUSE_S)
     transcript_path.write_text(json.dumps(words, ensure_ascii=False, indent=2), encoding="utf-8")
     (transcript_dir / "transcript.txt").write_text(transcript_txt + "\n", encoding="utf-8")
     scene_seed = {
@@ -235,7 +243,7 @@ def _prepare_synthesized_source(
         "scene_seed_path": str(seed_path),
         "target_duration": float(scene_seed.get("total_duration_s") or 0),
         "script_sha256": script_sha256,
-        "tts": {"provider": "aliyun-bailian", "segments": tts_segments},
+        "tts": {"provider": "aliyun-bailian", "segment_pause_s": TTS_SEGMENT_PAUSE_S, "segments": tts_segments},
     }
     meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
     return PreparedSource(
@@ -374,14 +382,54 @@ def segment_script_for_tts(text: str, target_chars: int = 55) -> list[str]:
     return [segment for segment in segments if segment.strip()]
 
 
-def concatenate_audio(parts: list[Path], output: Path) -> None:
+def _concat_list_line(path: Path) -> str:
+    escaped = path.resolve().as_posix().replace("'", "'\\''")
+    return f"file '{escaped}'\n"
+
+
+def concatenate_audio(parts: list[Path], output: Path, pause_s: float = 0.0) -> None:
     if not parts:
         raise RuntimeError("阿里云 TTS 没有生成任何旁白片段。")
     if len(parts) == 1:
         shutil.copy2(parts[0], output)
         return
     list_path = output.parent / "tts_concat.txt"
-    list_path.write_text("".join(f"file '{part.as_posix()}'\n" for part in parts), encoding="utf-8")
+    concat_parts: list[Path] = []
+    if pause_s > 0:
+        silence_path = output.parent / "tts_pause_300ms.wav"
+        with wave.open(str(parts[0]), "rb") as handle:
+            sample_rate = handle.getframerate() or 24000
+            channels = handle.getnchannels() or 1
+        channel_layout = "mono" if channels == 1 else "stereo"
+        silence = subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                f"anullsrc=channel_layout={channel_layout}:sample_rate={sample_rate}",
+                "-t",
+                f"{pause_s:.3f}",
+                "-c:a",
+                "pcm_s16le",
+                str(silence_path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        if silence.returncode != 0:
+            raise RuntimeError(f"生成 TTS 断句静音失败：{(silence.stderr or '').strip()[-600:]}")
+        for index, part in enumerate(parts):
+            concat_parts.append(part)
+            if index < len(parts) - 1:
+                concat_parts.append(silence_path)
+    else:
+        concat_parts = list(parts)
+    list_path.write_text("".join(_concat_list_line(part) for part in concat_parts), encoding="utf-8")
     proc = subprocess.run(
         ["ffmpeg", "-y", "-loglevel", "error", "-f", "concat", "-safe", "0", "-i", str(list_path), "-c:a", "pcm_s16le", str(output)],
         capture_output=True,

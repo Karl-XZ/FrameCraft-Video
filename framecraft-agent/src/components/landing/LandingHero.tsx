@@ -107,7 +107,7 @@ export default function LandingHero() {
             />
             <FeatureCard
               title="证据与工程可追溯"
-              description="保留来源台账、字幕、时间线和 HyperFrames 工程，方便复核与再渲染"
+              description="保留音频、讲稿、字幕、时间线和 HyperFrames 工程，方便复核与再渲染"
               icon={<Download className="w-5 h-5 text-accent" />}
               gradient="bg-accent/15 text-accent"
             />

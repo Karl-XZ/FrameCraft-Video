@@ -14,15 +14,46 @@ import StudioEmptyState from '../studio/StudioEmptyState';
 import AnalysisProgressPanel from '../studio/AnalysisProgressPanel';
 import EditPlanCard from '../studio/EditPlanCard';
 import VideoPreviewArea from '../studio/VideoPreviewArea';
-import DownloadResultCard from '../studio/DownloadResultCard';
 import MiniTimeline from '../studio/MiniTimeline';
 import AgentChatPanel from '../agent/AgentChatPanel';
 import AssetDetailDrawer from '../asset/AssetDetailDrawer';
 import GradientButton from '../ui/GradientButton';
 
+function GeneratedFileLink({
+  title,
+  description,
+  href,
+  icon,
+  disabled,
+}: {
+  title: string;
+  description: string;
+  href?: string | null;
+  icon: React.ReactNode;
+  disabled?: boolean;
+}) {
+  const content = (
+    <div className={`rounded-xl border p-3 transition-all ${
+      disabled
+        ? 'border-white/6 bg-white/[0.025] opacity-45'
+        : 'border-white/10 bg-white/[0.045] hover:border-primary/35 hover:bg-primary/10'
+    }`}>
+      <div className="flex items-center gap-3">
+        <div className="w-9 h-9 rounded-lg bg-white/8 flex items-center justify-center flex-shrink-0">{icon}</div>
+        <div className="min-w-0">
+          <p className="text-xs font-semibold text-text-main truncate">{title}</p>
+          <p className="text-[10px] text-text-muted truncate">{description}</p>
+        </div>
+      </div>
+    </div>
+  );
+  if (disabled || !href) return <div>{content}</div>;
+  return <a href={href} download>{content}</a>;
+}
+
 export default function StudioLayout() {
   const {
-    step, assets, filter,
+    projectId, step, assets, filter,
     setSelectedAssetId, setShowAssetDrawer,
     generateHyperFramesProgress, generateDraftProgress,
     versions, currentVersionId, setCurrentVersionId, setPreviewUrl, setVersion, previewUrl, error,
@@ -95,7 +126,7 @@ export default function StudioLayout() {
             )}
             {currentVersion?.status === 'local_render_failed' && !previewUrl && (
               <p className="mx-auto max-w-md text-center text-xs leading-relaxed text-text-muted">
-                这版成片未通过验收。若当前页面已刷新，本机临时视频需要重新生成后才能播放；请在 Agent 对话中查看评分和问题，并决定是否重试设计。
+                这版成片的严格验收发现部分可能的问题。若当前页面已刷新，本机临时视频需要重新生成后才能播放；请在 Agent 对话中查看参考分和可能问题，并决定是否重试设计。
               </p>
             )}
             <div className="flex items-center gap-2 flex-wrap">
@@ -119,40 +150,6 @@ export default function StudioLayout() {
                 </button>
               ))}
             </div>
-            {currentVersion && (
-              <div className="grid grid-cols-2 gap-3">
-                {previewUrl && (
-                  <a href={previewUrl} download={`framecraft-${currentVersion.id}.mp4`}>
-                    <DownloadResultCard title="本机视频" description="MP4 · 仅在当前电脑" icon={<Zap className="w-4 h-4 text-primary-light" />} badge="本地" badgeVariant="primary" size="MP4" />
-                  </a>
-                )}
-                {currentVersion.timeline_url && (
-                  <a href={api.fileUrl(currentVersion.timeline_url)} download>
-                    <DownloadResultCard title="项目时间线" description="timeline.json" icon={<FileJson className="w-4 h-4 text-accent" />} badge="JSON" badgeVariant="info" size="JSON" />
-                  </a>
-                )}
-                {currentVersion.hyperframes_url && (
-                  <a href={api.fileUrl(currentVersion.hyperframes_url)} download>
-                    <DownloadResultCard title="HyperFrames 工程" description="HTML 成片工程 zip" icon={<Layers className="w-4 h-4 text-primary-light" />} badge="HF" badgeVariant="primary" size="ZIP" />
-                  </a>
-                )}
-                {currentVersion.subtitles_url && (
-                  <a href={api.fileUrl(currentVersion.subtitles_url)} download>
-                    <DownloadResultCard title="字幕文件" description="SRT 格式" icon={<Zap className="w-4 h-4 text-warning" />} badge="可编辑" badgeVariant="info" size="SRT" />
-                  </a>
-                )}
-                {currentVersion.source_ledger_url && (
-                  <a href={api.fileUrl(currentVersion.source_ledger_url)} download>
-                    <DownloadResultCard title="来源台账" description="逐场事实与链接" icon={<FileJson className="w-4 h-4 text-secondary" />} badge="来源" badgeVariant="info" size="MD" />
-                  </a>
-                )}
-                {currentVersion.cover_url && (
-                  <a href={api.fileUrl(currentVersion.cover_url)} download>
-                    <DownloadResultCard title="封面图" description="PNG 封面" icon={<Sparkles className="w-4 h-4 text-accent" />} badge="新生成" badgeVariant="warning" size="PNG" />
-                  </a>
-                )}
-              </div>
-            )}
             <MiniTimeline />
           </div>
         );
@@ -211,6 +208,47 @@ export default function StudioLayout() {
               className="w-full min-h-28 resize-y rounded-lg bg-white/5 border border-white/8 px-3 py-2 text-xs text-text-main placeholder:text-text-muted focus:outline-none focus:border-primary/40"
             />
           </div>}
+          <div className="space-y-2">
+            <div className="flex items-center justify-between">
+              <span className="text-sm font-bold text-text-main">项目文件</span>
+              <span className="text-[10px] text-text-muted">生成后可查阅下载</span>
+            </div>
+            <GeneratedFileLink
+              title={inputMode === 'media' ? '原始声音文件' : '旁白音频'}
+              description="WAV · 声音轨道"
+              href={projectId ? api.fileUrl(`/api/projects/${projectId}/source/audio`) : null}
+              disabled={!projectId || !currentVersion}
+              icon={<Zap className="w-4 h-4 text-secondary" />}
+            />
+            <GeneratedFileLink
+              title="讲稿文件"
+              description="TXT · 逐字内容"
+              href={projectId ? api.fileUrl(`/api/projects/${projectId}/source/script-file`) : null}
+              disabled={!projectId || !currentVersion}
+              icon={<FileJson className="w-4 h-4 text-accent" />}
+            />
+            <GeneratedFileLink
+              title="工程文件"
+              description="ZIP · HyperFrames HTML"
+              href={currentVersion?.hyperframes_url ? api.fileUrl(currentVersion.hyperframes_url) : null}
+              disabled={!currentVersion?.hyperframes_url}
+              icon={<Layers className="w-4 h-4 text-primary-light" />}
+            />
+            <GeneratedFileLink
+              title="字幕文件"
+              description="SRT · 底部居中字幕"
+              href={currentVersion?.subtitles_url ? api.fileUrl(currentVersion.subtitles_url) : null}
+              disabled={!currentVersion?.subtitles_url}
+              icon={<Zap className="w-4 h-4 text-warning" />}
+            />
+            <GeneratedFileLink
+              title="本机成片"
+              description="MP4 · 仅当前电脑临时保存"
+              href={previewUrl}
+              disabled={!previewUrl || !currentVersion}
+              icon={<Sparkles className="w-4 h-4 text-primary-light" />}
+            />
+          </div>
           <AssetFilterTabs />
           <div className="flex-1 overflow-y-auto space-y-2">
             {filteredAssets.map((asset) => (

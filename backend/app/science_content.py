@@ -1,13 +1,8 @@
 from __future__ import annotations
 
 import json
-import ipaddress
-import socket
 from pathlib import Path
 from typing import Any
-from urllib.parse import urljoin, urlparse
-
-import requests
 
 from .deepseek_api import create_client, deepseek_settings, parse_json_object
 
@@ -29,8 +24,8 @@ def generate_science_brief(topic: str, requirements: str, target_duration: int) 
                 "role": "system",
                 "content": """你是严谨的中文科普总编。只输出 JSON，不输出 Markdown。
 输出结构：
-{"title":"","audience":"","takeaway":"","chapters":[{"title":"","narration":"","visual_claim":"","motion":"mechanism|scale|comparison|timeline|system","evidence_ids":[""]}],"sources":[{"id":"S1","claim":"","organization":"","page":"","url":"https://..."}]}
-要求：讲稿口语自然、由问题推进到解释和结论；每章只讲一个核心概念；总字数接近指定值；不写制作术语；避免使用“不是……而是……”句式；不得编造实验、数字、机构或链接。只有确信存在对应权威页面时才使用具体数字并登记来源；无法可靠给出来源时改写为不依赖精确数字的定性表达。来源优先政府、国际组织、标准组织、论文原始页面。""",
+{"title":"","audience":"","takeaway":"","chapters":[{"title":"","narration":"","visual_claim":"","motion":"mechanism|scale|comparison|timeline|system","evidence_ids":[]}],"sources":[]}
+要求：讲稿口语自然、由问题推进到解释和结论；每章只讲一个核心概念；总字数接近指定值；不写制作术语；避免使用“不是……而是……”句式；不得编造实验、数字、机构、链接或来源标注。当前模型不能联网，因此不生成外部来源；涉及精确数字时只使用通用可靠常识，否则改写为定性表达。""",
             },
             {
                 "role": "user",
@@ -56,7 +51,7 @@ def generate_science_brief(topic: str, requirements: str, target_duration: int) 
         raise RuntimeError("DeepSeek 没有生成完整的科普章节。")
     brief["chapters"] = chapters
     brief = _fit_narration_length(brief, target_chars)
-    brief["sources"] = _verify_public_sources(brief.get("sources") or [])
+    brief["sources"] = []
     brief["topic"] = topic
     brief["requirements"] = (requirements or "").strip()
     return brief
@@ -126,70 +121,3 @@ def _hard_fit_chapters(chapters: list[dict[str, Any]], maximum: int) -> list[dic
         text = str(longest.get("narration") or "").rstrip("。")
         longest["narration"] = text[:-1].rstrip("，；：、 ") + "。"
     return result
-
-
-def _verify_public_sources(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    verified: list[dict[str, Any]] = []
-    for item in items[:6]:
-        url = str(item.get("url") or "").strip()
-        if not url.startswith("https://"):
-            continue
-        try:
-            final_url = _probe_public_url(url)
-        except (OSError, ValueError, requests.RequestException):
-            continue
-        verified.append({**item, "url": final_url, "url_verified": True})
-    return verified
-
-
-def _probe_public_url(url: str) -> str:
-    current = url
-    for _ in range(4):
-        parsed = urlparse(current)
-        if parsed.scheme != "https" or not parsed.hostname:
-            raise ValueError("来源链接必须是公开 HTTPS 地址。")
-        for info in socket.getaddrinfo(parsed.hostname, 443, type=socket.SOCK_STREAM):
-            address = ipaddress.ip_address(info[4][0])
-            if not address.is_global:
-                raise ValueError("来源链接不能访问内网地址。")
-        response = requests.get(
-            current,
-            headers={"Range": "bytes=0-1023", "User-Agent": "FrameCraft-SourceVerifier/1.0"},
-            timeout=8,
-            allow_redirects=False,
-            stream=True,
-        )
-        if response.status_code in {301, 302, 303, 307, 308}:
-            location = response.headers.get("Location")
-            response.close()
-            if not location:
-                raise ValueError("来源重定向缺少地址。")
-            current = urljoin(current, location)
-            continue
-        response.close()
-        if response.status_code >= 400:
-            raise requests.HTTPError(f"source status {response.status_code}")
-        return current
-    raise ValueError("来源重定向次数过多。")
-
-
-def write_source_ledger(path: Path, brief: dict[str, Any]) -> None:
-    lines = [
-        "# 科普来源台账",
-        "",
-        "| 编号 | 支持的表述 | 机构 / 页面 | 链接 |",
-        "| --- | --- | --- | --- |",
-    ]
-    for item in brief.get("sources") or []:
-        url = str(item.get("url") or "").strip()
-        if not url.startswith("https://"):
-            continue
-        organization = str(item.get("organization") or "").strip()
-        page = str(item.get("page") or "").strip()
-        lines.append(
-            f"| {str(item.get('id') or '').strip()} | {str(item.get('claim') or '').strip()} | "
-            f"{organization} / {page} | {url} |"
-        )
-    if len(lines) == 4:
-        lines.append("| - | 本片未采用需要外部精确数据支撑的屏幕数字 | - | - |")
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")

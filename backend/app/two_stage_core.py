@@ -48,7 +48,6 @@ def create_plan(
             "page_id": f"page-{index:02d}", "duration_s": float(scene.get("duration_s") or 0),
             "start_s": float(scene.get("start_s") or 0), "end_s": float(scene.get("end_s") or 0),
             "transcript": str(scene.get("transcript") or ""), "visual_claim": str(scene.get("visual_claim") or ""),
-            "sources": scene.get("evidence_sources") or [],
         }
         for index, scene in enumerate(seed.get("scenes") or [], start=1)
     ]
@@ -70,6 +69,7 @@ def create_plan(
     for page, segment in zip(pages, segments):
         if page.get("page_id") != segment["page_id"] or abs(float(page.get("duration_s") or 0) - segment["duration_s"]) > 0.15:
             raise RuntimeError("提示词 AI 改写了页面时间轴。")
+        page.pop("source_label", None)
     plan["project"] = {**plan.get("project", {}), "width": width, "height": height, "total_duration_s": duration, "language": "简体中文"}
     return plan, {"stage": "prompt_ai", "input": payload, "raw": raw, **trace}
 
@@ -80,7 +80,7 @@ def _caption_template(cues: list[dict[str, Any]], width: int, height: int, durat
     for i, cue in enumerate(cues):
         start, end = float(cue["start"]), float(cue["end"])
         actions.append(f"tl.to(q('#cap-{i}'),{{autoAlpha:1,y:0,duration:.16,ease:'power2.out'}},{start:.3f});tl.to(q('#cap-{i}'),{{autoAlpha:0,y:-8,duration:.16,ease:'power2.in'}},{max(start+.3,end-.12):.3f});")
-    return f'''<template id="captions-template"><div class="clip" data-composition-id="captions" data-width="{width}" data-height="{height}" data-start="0" data-duration="{duration:.3f}"><style>@font-face{{font-family:'FrameCraftCN';src:local('PingFang SC'),local('Microsoft YaHei'),local('Noto Sans CJK SC');font-weight:100 900}}[data-composition-id="captions"]{{position:absolute;inset:0;pointer-events:none;font-family:FrameCraftCN}}.cap{{position:absolute;left:50%;bottom:{70 if height>width else 56}px;transform:translateX(-50%);max-width:{int(width*.78)}px;padding:12px 24px;border-radius:18px;background:rgba(0,0,0,.52);color:#fff;font-size:{42 if height>width else 32}px;line-height:1.35;text-align:center;opacity:0;white-space:nowrap}}</style>{items}<script>const root=document.querySelector('[data-composition-id="captions"]');const q=s=>root.querySelector(s);const tl=gsap.timeline({{paused:true}});{''.join(actions)}window.__timelines=window.__timelines||{{}};window.__timelines['captions']=tl;</script></div></template>'''
+    return f'''<template id="captions-template"><div class="clip" data-composition-id="captions" data-width="{width}" data-height="{height}" data-start="0" data-duration="{duration:.3f}"><style>@font-face{{font-family:'FrameCraftCN';src:local('PingFang SC'),local('Microsoft YaHei'),local('Noto Sans CJK SC');font-weight:100 900}}[data-composition-id="captions"]{{position:absolute;inset:0;z-index:2147483647;isolation:isolate;pointer-events:none;font-family:FrameCraftCN}}.cap{{position:absolute;z-index:2147483647;left:50%;bottom:{70 if height>width else 56}px;transform:translateX(-50%);max-width:{int(width*.78)}px;padding:12px 24px;border-radius:18px;background:rgba(0,0,0,.52);color:#fff;font-size:{42 if height>width else 32}px;line-height:1.35;text-align:center;opacity:0;white-space:nowrap;filter:drop-shadow(0 12px 28px rgba(0,0,0,.32))}}</style>{items}<script>const root=document.querySelector('[data-composition-id="captions"]');const q=s=>root.querySelector(s);const tl=gsap.timeline({{paused:true}});{''.join(actions)}window.__timelines=window.__timelines||{{}};window.__timelines['captions']=tl;</script></div></template>'''
 
 
 def _host(plan: dict[str, Any], audio: str, cues: list[dict[str, Any]]) -> str:
@@ -91,7 +91,7 @@ def _host(plan: dict[str, Any], audio: str, cues: list[dict[str, Any]]) -> str:
         dur = float(page["duration_s"])
         mounts.append(f'<div id="slot-{index}" data-composition-id="{page["page_id"]}" data-composition-src="compositions/{page["page_id"]}.html" data-start="{cursor:.3f}" data-duration="{dur:.3f}" data-track-index="1" data-width="{width}" data-height="{height}"></div>')
         cursor += dur
-    return f'''<!doctype html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width={width}, height={height}"><script src="https://cdn.jsdelivr.net/npm/gsap@3.14.2/dist/gsap.min.js"></script><style>*{{box-sizing:border-box}}html,body{{margin:0;width:{width}px;height:{height}px;overflow:hidden;background:#050810}}</style></head><body><div id="main" data-composition-id="main" data-width="{width}" data-height="{height}" data-start="0" data-duration="{total}">{''.join(mounts)}<div data-composition-id="captions" data-composition-src="compositions/captions.html" data-start="0" data-duration="{total}" data-track-index="9" data-width="{width}" data-height="{height}"></div><audio id="narration" data-start="0" data-duration="{total}" data-track-index="0" src="assets/{audio}" preload="auto"></audio></div><script>window.__timelines=window.__timelines||{{}};window.__timelines.main=gsap.timeline({{paused:true}});</script></body></html>'''
+    return f'''<!doctype html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width={width}, height={height}"><script src="https://cdn.jsdelivr.net/npm/gsap@3.14.2/dist/gsap.min.js"></script><style>*{{box-sizing:border-box}}html,body{{margin:0;width:{width}px;height:{height}px;overflow:hidden;background:#050810}}#main{{position:relative;isolation:isolate;width:{width}px;height:{height}px}}</style></head><body><div id="main" data-composition-id="main" data-width="{width}" data-height="{height}" data-start="0" data-duration="{total}">{''.join(mounts)}<div data-composition-id="captions" data-composition-src="compositions/captions.html" data-start="0" data-duration="{total}" data-track-index="9999" data-width="{width}" data-height="{height}"></div><audio id="narration" data-start="0" data-duration="{total}" data-track-index="0" src="assets/{audio}" preload="auto"></audio></div><script>window.__timelines=window.__timelines||{{}};window.__timelines.main=gsap.timeline({{paused:true}});</script></body></html>'''
 
 
 def materialize_two_stage_version(
@@ -120,7 +120,7 @@ def materialize_two_stage_version(
         page_traces.append({"page_id": pid, "raw": raw, **trace})
     (comp_dir / "captions.html").write_text(_caption_template(cues, int(plan["project"]["width"]), int(plan["project"]["height"]), float(plan["project"]["total_duration_s"])), encoding="utf-8")
     (hyperframes_dir / "index.html").write_text(_host(plan, audio_asset_name, cues), encoding="utf-8")
-    timeline = {"project_id": project.get("id"), "total_duration": plan["project"]["total_duration_s"], "scenes":[{"scene_number":i,"scene_id":p["page_id"],"start_time":round(sum(float(x["duration_s"]) for x in plan["pages"][:i-1]),3),"end_time":round(sum(float(x["duration_s"]) for x in plan["pages"][:i]),3),"duration":p["duration_s"],"headline":p.get("title"),"semantic_motion":p.get("visual_concept"),"source_label":p.get("source_label")} for i,p in enumerate(plan["pages"],1)],"captions":cues}
+    timeline = {"project_id": project.get("id"), "total_duration": plan["project"]["total_duration_s"], "scenes":[{"scene_number":i,"scene_id":p["page_id"],"start_time":round(sum(float(x["duration_s"]) for x in plan["pages"][:i-1]),3),"end_time":round(sum(float(x["duration_s"]) for x in plan["pages"][:i]),3),"duration":p["duration_s"],"headline":p.get("title"),"semantic_motion":p.get("visual_concept")} for i,p in enumerate(plan["pages"],1)],"captions":cues}
     (version_dir / "timeline.json").write_text(json.dumps(timeline, ensure_ascii=False, indent=2)+"\n", encoding="utf-8")
     (version_dir / "two_stage_trace.json").write_text(json.dumps({"prompt_ai":plan_trace,"animation_ai":page_traces},ensure_ascii=False,indent=2)+"\n",encoding="utf-8")
     return {"duration_s":float(plan["project"]["total_duration_s"]),"scene_count":len(plan["pages"]),"caption_count":len(cues),"scene_code_count":len(plan["pages"]),"plan":plan}

@@ -111,7 +111,7 @@ export function useStudioWorkflow() {
       store.setStep('result');
       store.setTaskText(
         cur.status === 'local_render_failed'
-          ? '上一版验收未通过，等待你决定是否重试'
+          ? '上一版严格验收发现可能问题，等待你决定是否重试'
           : pendingVersion
             ? '工程已就绪，可在当前浏览器生成 MP4'
             : '生成完成',
@@ -361,7 +361,7 @@ export function useStudioWorkflow() {
       const videoUrl = URL.createObjectURL(localResult.video);
       if (review.status === 'awaiting_user_retry') {
         store.setGenerateHyperFramesProgress(100);
-        await refreshVersions(projectId, '成片已生成，验收未通过，等待你决定是否重试');
+        await refreshVersions(projectId, '成片已生成，严格验收发现可能问题，等待你决定是否重试');
         store.setPreviewUrl(videoUrl);
         store.setStep('result');
         await refreshChat(projectId);
@@ -496,7 +496,7 @@ export function useStudioWorkflow() {
     if (failed) {
       store.setCurrentVersionId(failed.id);
       store.setStep('result');
-      store.setTaskText('上一版验收未通过，请在 Agent 对话中决定是否重试');
+      store.setTaskText('上一版严格验收发现可能问题，请在 Agent 对话中决定是否重试');
       await refreshChat(projectId);
       return;
     }

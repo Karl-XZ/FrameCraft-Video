@@ -5,7 +5,6 @@ import json
 import re
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
 
 from .agent_scene_code import validate_scene_code, validate_scene_code_set, write_scene_sources
 from .ingest import build_subtitle_cues, normalize_words
@@ -99,7 +98,6 @@ def build_science_video_analysis(project: dict[str, Any], prepared: Any) -> dict
                 "subline": scene["subline"],
                 "chips": scene["chips"],
                 "quote": scene["quote"],
-                "source_label": scene.get("source_label"),
                 "code_generator": scene.get("code_generator"),
                 "code_reviewer": scene.get("code_reviewer"),
             }
@@ -200,7 +198,6 @@ def build_timeline_payload(
                 "subline": scene["subline"],
                 "chips": scene["chips"],
                 "elements": scene["elements"],
-                "source_label": scene.get("source_label"),
                 "code_generator": scene.get("code_generator"),
                 "code_reviewer": scene.get("code_reviewer"),
             }
@@ -1018,7 +1015,7 @@ def render_scene_markup(scene: dict[str, Any], width: int, height: int) -> str:
     quote = html.escape(scene["quote"])
     chips = "\n".join(f'<div class="chip">{html.escape(text)}</div>' for text in scene["chips"][:4])
     main = render_agent_scene_markup(scene)
-    source = f'<div class="source-line">{html.escape(scene["source_label"])}</div>' if scene.get("source_label") else ""
+    source = ""
     return f"""
 <section id="{html.escape(scene['scene_id'])}" class="scene clip variant-{scene['variant']} layout-{scene['layout']} scene-order-{scene['scene_number']} agent-generated-scene" data-start="{scene['start']:.3f}" data-duration="{scene['duration']:.3f}">
   <div class="scene-shell">
@@ -1256,15 +1253,6 @@ def _build_scene_specs(
         subline = normalize_text(str(raw.get("visual_claim") or ""))[:32] or choose_subline(clauses)[:32]
         chips = choose_chips(clauses)
         steps = choose_steps(transcript, clauses, variant)
-        sources = list(raw.get("evidence_sources") or [])
-        source_label = ""
-        if sources:
-            evidence = sources[0]
-            url = str(evidence.get("url") or "")
-            domain = urlparse(url).netloc.removeprefix("www.")
-            source_label = " · ".join(
-                part for part in ["来源", str(evidence.get("organization") or ""), str(evidence.get("page") or ""), domain] if part
-            )
         scene = {
             "scene_number": int(raw.get("sceneNumber") or idx),
             "scene_id": str(raw.get("sceneId") or f"scene_{idx}"),
@@ -1281,7 +1269,6 @@ def _build_scene_specs(
             "quote": transcript,
             "core_title": chips[0] if chips else headline,
             "core_sub": subline,
-            "source_label": source_label,
         }
         if variant == "data":
             scene["values"] = build_metric_values(chips, transcript)

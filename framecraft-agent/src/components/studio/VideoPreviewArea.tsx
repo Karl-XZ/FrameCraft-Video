@@ -2,7 +2,7 @@ import React from 'react';
 import { useProjectStore } from '../../store/projectStore';
 
 export default function VideoPreviewArea() {
-  const { previewUrl, version, videoRatio } = useProjectStore();
+  const { previewUrl, videoRatio } = useProjectStore();
   const aspect = videoRatio === '16:9' ? 'aspect-video' : videoRatio === '1:1' ? 'aspect-square' : 'aspect-[9/16]';
 
   if (!previewUrl) {
@@ -16,9 +16,6 @@ export default function VideoPreviewArea() {
   return (
     <div className={`relative rounded-2xl overflow-hidden bg-black ${aspect} max-h-full`}>
       <video src={previewUrl} controls className="w-full h-full object-contain" />
-      <div className="absolute top-3 right-3 px-2 py-1 rounded-md glass text-xs text-text-secondary">
-        {version}
-      </div>
     </div>
   );
 }

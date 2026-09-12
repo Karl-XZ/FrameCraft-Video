@@ -908,7 +908,6 @@ class SingleAgentRunner:
                 "draft_url": None,
                 "timeline_url": f"/api/projects/{pid}/versions/{vid}/timeline",
                 "subtitles_url": f"/api/projects/{pid}/versions/{vid}/subtitles",
-                "source_ledger_url": f"/api/projects/{pid}/versions/{vid}/source-ledger" if (vdir / "SOURCE_LEDGER.md").is_file() else None,
                 "cover_url": None,
                 "publish_copy_url": None,
                 "hyperframes_url": f"/api/projects/{pid}/versions/{vid}/hyperframes" if hyperframes_zip else None,
@@ -1055,7 +1054,6 @@ class SingleAgentRunner:
                     {
                         "project": project.get("name"),
                         "input_mode": project.get("input_mode"),
-                        "requires_source_labels": project.get("input_mode") == "topic",
                         "duration_s": expected_duration,
                         "source_transcript": source_text,
                         "scenes": timeline.get("scenes") or creative_plan.get("scenes") or [],
@@ -1150,13 +1148,13 @@ class SingleAgentRunner:
     ) -> dict[str, Any]:
         score = float(review.get("score") or 0)
         issue_texts = self._review_issue_texts(review)
-        summary = str(review.get("summary") or "质量未达到验收标准")
-        reason = f"视觉 Agent 验收未通过：{'; '.join(issue_texts or [summary])}"
+        summary = str(review.get("summary") or "严格验收发现部分可能的问题")
+        reason = f"严格视觉验收发现可能问题：{'; '.join(issue_texts or [summary])}"
         issue_lines = "\n".join(f"{index}. {text}" for index, text in enumerate(issue_texts or [summary], start=1))
         content = (
-            f"本次成片验收得分：{score:g}/100，未达到 82 分通过线。\n\n"
-            f"发现的问题：\n{issue_lines}\n\n"
-            "成片已保留在中间页面，可以直接播放检查。是否根据这些问题重新生成？"
+            f"本次严格验收参考分：{score:g}/100。80 分以上已经接近高分线；当前校验比较严格，所以我发现了部分可能影响观感的问题。\n\n"
+            f"可能的问题：\n{issue_lines}\n\n"
+            "成片已保留在中间页面，可以直接播放检查。是否根据这些可能的问题重新生成？"
         )
 
         def op(data):
@@ -1203,7 +1201,7 @@ class SingleAgentRunner:
             review = {
                 "pass": False,
                 "score": version.get("review_score") or 0,
-                "summary": version.get("review_error") or "上一版未通过验收",
+                "summary": version.get("review_error") or "上一版严格验收发现部分可能的问题",
                 "issues": version.get("review_issues") or [],
             }
         timeline = _safe_json(version_dir / "timeline.json")
@@ -1517,7 +1515,7 @@ class SingleAgentRunner:
         created = self._tool_create_version_dir(job_id, version_hint)
         version_dir = Path(str(created["version_dir"]))
         shutil.copytree(base_hf, version_dir / "hyperframes", dirs_exist_ok=True)
-        for name in ("timeline.json", "subtitles.srt", "SOURCE_LEDGER.md", "local_render_manifest.json"):
+        for name in ("timeline.json", "subtitles.srt", "local_render_manifest.json"):
             src = base_dir / name
             if src.is_file():
                 shutil.copy2(src, version_dir / name)
@@ -1542,7 +1540,7 @@ class SingleAgentRunner:
                     "content": (
                         (PROMPTS_DIR / "dialogue_ai_system.md").read_text(encoding="utf-8")
                         + "\n\n现在你处于微调执行阶段。请直接返回需要写入的完整工程文件内容。"
-                        "只改满足用户要求的最少文件；保持音频、字幕时间轴、来源左下角和可渲染契约不变。"
+                        "只改满足用户要求的最少文件；保持音频、字幕时间轴、字幕最高层级和可渲染契约不变。"
                         "输出 JSON：reply, changed_files, timeline。"
                     ),
                 },
@@ -1692,9 +1690,6 @@ class SingleAgentRunner:
             progress=lambda progress, step: self._set_step(job_id, progress, step),
             revision_feedback=revision_feedback,
         )
-        source_ledger = prepared.source_dir / "SOURCE_LEDGER.md"
-        if source_ledger.is_file():
-            shutil.copy2(source_ledger, version_dir / "SOURCE_LEDGER.md")
         render_fps = int((job.get("payload") or {}).get("fps") or 24)
         render_fps = max(15, min(render_fps, 60))
         if self._render_target(job) == "local":
@@ -1733,10 +1728,9 @@ class SingleAgentRunner:
         sheet = self._extract_contact_sheet(version_dir / "preview.mp4", version_dir / "visual-review.jpg", summary["duration_s"])
         review = run_visual_review(
             sheet,
-                {
-                    "project": project.get("name"),
-                    "input_mode": project.get("input_mode"),
-                    "requires_source_labels": project.get("input_mode") == "topic",
+            {
+                "project": project.get("name"),
+                "input_mode": project.get("input_mode"),
                 "duration_s": summary["duration_s"],
                 "source_transcript": prepared.source_text,
                 "scenes": summary["plan"].get("pages") or [],
@@ -1748,7 +1742,7 @@ class SingleAgentRunner:
             json.dumps(review, ensure_ascii=False, indent=2), encoding="utf-8"
         )
         if not review.get("pass") or float(review.get("score") or 0) < 82:
-            raise RuntimeError(f"视觉 Agent 验收未通过：{'; '.join(review.get('issues') or [review.get('summary') or '质量不足'])}")
+            raise RuntimeError(f"严格视觉验收发现可能问题：{'; '.join(review.get('issues') or [review.get('summary') or '质量不足'])}")
 
         self._set_step(job_id, 94, "正在注册版本与整理下载产物")
         registered = self._tool_register_version(job_id, str(version_dir), str(version_dir / "preview.mp4"))
@@ -1931,7 +1925,7 @@ class SingleAgentRunner:
 8. 不要直接运行 `hyperframes init`。创建版本目录后，优先调用 `bootstrap_hyperframes_project` 离线生成 `hyperframes/` 子工程，再在其中写 HTML 和真实渲染。
 
 工作边界：
-- 主题模式：DeepSeek 已生成科普讲稿、章节、视觉主张与来源台账；沿用这些内容继续设计。
+- 主题模式：DeepSeek 已生成科普讲稿、章节与视觉主张；沿用这些内容继续设计，不生成来源标注。
 - 文案模式：阿里云已经严格按用户原文生成旁白；不得改写正文或二次换旁白。
 - 媒体模式：必须保留上传音频或视频原音轨；阿里云 ASR 只负责转写，不允许重配旁白。
 - 当前工程不导出剪映草稿。

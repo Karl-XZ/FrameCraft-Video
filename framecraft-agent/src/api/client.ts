@@ -135,7 +135,6 @@ export interface BackendVersion {
   draft_url: string | null;
   timeline_url: string | null;
   subtitles_url: string | null;
-  source_ledger_url?: string | null;
   cover_url: string | null;
   publish_copy_url: string | null;
   hyperframes_url: string | null;
