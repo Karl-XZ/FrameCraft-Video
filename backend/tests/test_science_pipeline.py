@@ -4,15 +4,17 @@ import json
 import tempfile
 import unittest
 import wave
+from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from backend.app import aliyun_speech, science_content
+from backend.app import aliyun_speech, science_content, store
+from backend.app.agent_scene_code import scene_code_fingerprint, validate_scene_code, validate_scene_code_set
 from backend.app.ingest import build_audio_scene_seed, build_subtitle_cues, infer_semantic_motion, segment_script_for_tts
 from backend.app.jiuwen_team import normalize_creative_plan
-from backend.app.managed_faceless_builder import apply_creative_plan, motif_matches_subject, render_semantic_science_markup
-from backend.app.premium_scene_renderer import render_premium_scene
+from backend.app.managed_faceless_builder import apply_creative_plan, render_agent_scene_markup, render_semantic_science_markup
+from backend.app.single_agent import SingleAgentRunner
 
 
 def wav_bytes(duration_s: float = 0.25) -> bytes:
@@ -25,7 +27,253 @@ def wav_bytes(duration_s: float = 0.25) -> bytes:
         return Path(handle.name).read_bytes()
 
 
+def generated_scene_code(number: int, shape: str = "orbit") -> dict[str, str]:
+    prefix = f"s{number:02d}-"
+    return {
+        "markup": (
+            f'<div class="agent-scene-stage {prefix}stage"><svg class="{prefix}visual" viewBox="0 0 1000 500">'
+            f'<path class="{prefix}path" d="M50 250 C300 20 700 480 950 250"/>'
+            f'<circle class="{prefix}node {prefix}{shape}" cx="500" cy="250" r="90"/></svg>'
+            f'<span class="{prefix}label">核心关系</span></div>'
+        ),
+        "css": (
+            f'.{prefix}stage{{inset:0;position:absolute}} .{prefix}visual{{width:100%;height:100%;overflow:visible}} '
+            f'.{prefix}path{{fill:none;stroke:#55c8ff;stroke-width:8}} .{prefix}node{{fill:#ffcc66}} '
+            f'.{prefix}label{{position:absolute;left:45%;top:45%;font-size:32px}}'
+        ),
+        "timeline_js": (
+            f"tl.fromTo(q('.{prefix}path'), {{strokeDasharray:1000,strokeDashoffset:1000}}, "
+            f"{{strokeDashoffset:0,duration:1}}, sceneStart+.2); "
+            f"tl.fromTo(q('.{prefix}node'), {{scale:0,transformOrigin:'center'}}, {{scale:1,duration:.8}}, sceneStart+.7); "
+            f"tl.to(q('.{prefix}node'), {{rotation:180,duration:sceneDuration*.36,ease:'none'}}, sceneStart+sceneDuration*.42); "
+            f"tl.fromTo(q('.{prefix}label'), {{opacity:0,y:20}}, {{opacity:1,y:0,duration:.5}}, sceneStart+1); "
+            f"tl.to(q('.{prefix}stage'), {{opacity:0,duration:.4}}, sceneEnd-.4);"
+        ),
+    }
+
+
 class SciencePipelineTests(unittest.TestCase):
+    def test_chat_before_first_render_asks_for_initial_generation(self):
+        state = {
+            "projects": {"p1": {"id": "p1", "name": "测试"}},
+            "versions": {},
+            "chat": {"p1": []},
+            "settings": store.default_db()["settings"],
+        }
+
+        def mutate(operation):
+            return operation(state)
+
+        runner = SingleAgentRunner()
+        with (
+            patch.object(store, "snapshot", side_effect=lambda: deepcopy(state)),
+            patch.object(store, "mutate", side_effect=mutate),
+        ):
+            message = runner.propose_chat_action("p1", "字幕大一点")
+
+        self.assertEqual(message["status"], "needs_initial_generation")
+        self.assertIsNone(message["action"])
+        self.assertIn("请先完成初版生成", message["content"])
+
+    @patch("backend.app.single_agent.deepseek_settings", return_value={"text_model": "deepseek-v4-flash"})
+    @patch("backend.app.single_agent.create_client")
+    def test_dialogue_ai_proposes_fine_tune_action_with_project_code_context(self, client: Mock, _settings: Mock):
+        with tempfile.TemporaryDirectory() as temp:
+            version_dir = Path(temp) / "v001"
+            hf_dir = version_dir / "hyperframes"
+            hf_dir.mkdir(parents=True)
+            (hf_dir / "index.html").write_text("<div>字幕</div>", encoding="utf-8")
+            (version_dir / "timeline.json").write_text(json.dumps({"scenes": []}), encoding="utf-8")
+            client.return_value.chat.completions.create.return_value = SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps({
+                    "intent": "fine_tune",
+                    "reply": "可以局部调大字幕。点击“微调”后，我会只改当前工程。",
+                    "button_label": "微调",
+                    "edit_summary": "把字幕字号调大，保持时间轴不变。",
+                    "target_files_hint": ["hyperframes/compositions/captions.html"],
+                }, ensure_ascii=False)))]
+            )
+            state = {
+                "projects": {"p1": {"id": "p1", "name": "测试", "status": "ready_to_render"}},
+                "versions": {
+                    "v001": {
+                        "id": "v001", "project_id": "p1", "version_dir": str(version_dir),
+                        "status": "local_render_ready", "version_number": 1,
+                    }
+                },
+                "chat": {"p1": []},
+                "settings": store.default_db()["settings"],
+            }
+
+            def mutate(operation):
+                return operation(state)
+
+            runner = SingleAgentRunner()
+            with (
+                patch.object(store, "snapshot", side_effect=lambda: deepcopy(state)),
+                patch.object(store, "mutate", side_effect=mutate),
+            ):
+                message = runner.propose_chat_action("p1", "字幕大一点")
+
+            sent_payload = json.loads(client.return_value.chat.completions.create.call_args.kwargs["messages"][1]["content"])
+            self.assertEqual(message["action"], "fine_tune_video")
+            self.assertEqual(message["version_id"], "v001")
+            self.assertIn("hyperframes_files", sent_payload["context"])
+            self.assertIn("字幕", sent_payload["context"]["hyperframes_files"][0]["preview"])
+
+    def test_regenerate_from_chat_passes_dialogue_summary_to_prompt_ai_job(self):
+        state = {
+            "projects": {"p1": {"id": "p1"}},
+            "versions": {
+                "v001": {
+                    "id": "v001", "project_id": "p1", "status": "local_render_ready",
+                    "render_fps": 24, "visual_revision_round": 0,
+                }
+            },
+            "chat": {
+                "p1": [{
+                    "id": "msg_action", "action": "regenerate_video", "version_id": "v001",
+                    "action_payload": {"user_message": "整体更高级", "edit_summary": "重做全片视觉体系"},
+                }]
+            },
+            "jobs": {},
+        }
+
+        def mutate(operation):
+            return operation(state)
+
+        runner = SingleAgentRunner()
+        with (
+            patch.object(store, "snapshot", side_effect=lambda: deepcopy(state)),
+            patch.object(store, "mutate", side_effect=mutate),
+            patch.object(runner, "start", return_value={"id": "job_regen"}) as start,
+        ):
+            job = runner.regenerate_from_chat("p1", "v001", "msg_action")
+
+        payload = start.call_args.args[2]
+        self.assertEqual(job["id"], "job_regen")
+        self.assertTrue(payload["patch"]["regenerate_all"])
+        self.assertEqual(payload["patch"]["chat_revision_request"]["edit_summary"], "重做全片视觉体系")
+        self.assertIsNone(state["chat"]["p1"][0]["action"])
+
+    def test_unplayable_render_auto_retry_starts_patch_job(self):
+        state = {
+            "projects": {"p1": {"id": "p1"}},
+            "versions": {
+                "v001": {
+                    "id": "v001", "project_id": "p1", "status": "awaiting_local_render",
+                    "render_fps": 24, "visual_revision_round": 0,
+                }
+            },
+            "chat": {"p1": []},
+            "jobs": {},
+        }
+
+        def mutate(operation):
+            return operation(state)
+
+        runner = SingleAgentRunner()
+        with (
+            patch.object(store, "snapshot", side_effect=lambda: deepcopy(state)),
+            patch.object(store, "mutate", side_effect=mutate),
+            patch.object(runner, "start", return_value={"id": "job_auto"}) as start,
+        ):
+            job = runner.retry_unplayable_render("p1", "v001", "播放器启动失败", 2)
+
+        payload = start.call_args.args[2]
+        self.assertEqual(job["id"], "job_auto")
+        self.assertEqual(payload["patch"]["unplayable_auto_retry_attempt"], 2)
+        self.assertEqual(state["versions"]["v001"]["status"], "local_render_failed")
+        self.assertIn("第 2/3 次", state["chat"]["p1"][-1]["content"])
+
+    def test_failed_visual_review_waits_for_explicit_user_retry(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            project_dir = root / "project"
+            version_dir = project_dir / "versions" / "v001"
+            version_dir.mkdir(parents=True)
+            (version_dir / "timeline.json").write_text(
+                json.dumps({"scenes": [{"scene_number": 1, "start_time": 0, "end_time": 10}]}),
+                encoding="utf-8",
+            )
+            contact_sheet = root / "contact.jpg"
+            contact_sheet.write_bytes(b"test-image")
+            state = {
+                "projects": {"p1": {"id": "p1", "name": "测试", "input_mode": "topic"}},
+                "versions": {
+                    "v001": {
+                        "id": "v001",
+                        "project_id": "p1",
+                        "version_dir": str(version_dir),
+                        "status": "awaiting_local_render",
+                        "expected_duration_s": 10,
+                        "render_fps": 24,
+                    }
+                },
+                "chat": {"p1": []},
+                "jobs": {},
+            }
+
+            def mutate(operation):
+                return operation(state)
+
+            runner = SingleAgentRunner()
+            review = {"pass": False, "score": 71, "summary": "构图拥挤", "issues": ["场景 1 标题遮挡主视觉"]}
+            with (
+                patch.object(store, "snapshot", side_effect=lambda: deepcopy(state)),
+                patch.object(store, "mutate", side_effect=mutate),
+                patch.object(store, "project_dir", return_value=project_dir),
+                patch("backend.app.single_agent.run_visual_review", return_value=review),
+                patch.object(runner, "start") as start,
+            ):
+                result = runner.review_local_render("p1", "v001", contact_sheet, {"duration_s": 10})
+
+            self.assertEqual(result["status"], "awaiting_user_retry")
+            self.assertEqual(state["projects"]["p1"]["status"], "awaiting_retry_decision")
+            self.assertEqual(state["chat"]["p1"][-1]["action"], "retry_render")
+            self.assertIn("71/100", state["chat"]["p1"][-1]["content"])
+            start.assert_not_called()
+
+    def test_explicit_retry_passes_review_to_prompt_ai_job(self):
+        with tempfile.TemporaryDirectory() as temp:
+            project_dir = Path(temp)
+            version_dir = project_dir / "versions" / "v001"
+            version_dir.mkdir(parents=True)
+            review = {"pass": False, "score": 70, "issues": ["第 2 幕信息层级不清"]}
+            (version_dir / "agent_visual_review.json").write_text(json.dumps(review), encoding="utf-8")
+            (version_dir / "timeline.json").write_text(
+                json.dumps({"scenes": [{"scene_number": 1}, {"scene_number": 2}]}), encoding="utf-8"
+            )
+            state = {
+                "projects": {"p1": {"id": "p1"}},
+                "versions": {
+                    "v001": {
+                        "id": "v001", "project_id": "p1", "version_dir": str(version_dir),
+                        "status": "local_render_failed", "render_fps": 24,
+                    }
+                },
+                "chat": {"p1": [{"action": "retry_render", "version_id": "v001"}]},
+                "jobs": {},
+            }
+
+            def mutate(operation):
+                return operation(state)
+
+            runner = SingleAgentRunner()
+            with (
+                patch.object(store, "snapshot", side_effect=lambda: deepcopy(state)),
+                patch.object(store, "mutate", side_effect=mutate),
+                patch.object(store, "project_dir", return_value=project_dir),
+                patch.object(runner, "start", return_value={"id": "job_retry"}) as start,
+            ):
+                result = runner.retry_local_render("p1", "v001")
+
+            payload = start.call_args.args[2]
+            self.assertEqual(result["id"], "job_retry")
+            self.assertEqual(payload["patch"]["visual_review"], review)
+            self.assertEqual(payload["patch"]["revision_scene_numbers"], [2])
+            self.assertIsNone(state["chat"]["p1"][0]["action"])
+
     def test_script_segmentation_preserves_text(self):
         text = "第一句解释现象。第二句解释原因。第三句给出结论。"
         segments = segment_script_for_tts(text, target_chars=12)
@@ -63,20 +311,14 @@ class SciencePipelineTests(unittest.TestCase):
             "labels": ["入射光", "散射光"],
             "actors": [{"kind": "ray"}, {"kind": "particle"}, {"kind": "observer"}],
             "animation_beats": [{"at": 0.1}, {"at": 0.4}, {"at": 0.7}],
+            "scene_code": generated_scene_code(1),
         }
         merged = normalize_creative_plan(source, art, [report], {"theme": {"accent": "#ffd36a"}, "scenes": []})
-        self.assertEqual(merged["scenes"][0]["motif"], "particle_scatter")
         self.assertEqual(len(merged["scenes"][0]["actors"]), 3)
         self.assertEqual(merged["theme"]["background"], "#020814")
+        self.assertIn("s01-stage", merged["scenes"][0]["scene_code"]["markup"])
 
-    def test_premium_motifs_render_distinct_scientific_visuals(self):
-        base = {"headline": "科学关系", "labels": ["光源", "介质", "观察者", "结果"], "steps": []}
-        motifs = ("spectrum_prism", "particle_scatter", "atmospheric_globe", "horizon_path", "split_synthesis")
-        outputs = [render_premium_scene({**base, "motif": motif}) for motif in motifs]
-        self.assertEqual(len(set(outputs)), len(motifs))
-        self.assertTrue(all('class="premium-stage' in output for output in outputs))
-
-    def test_creative_plan_assigns_premium_motif_when_agent_omits_scene(self):
+    def test_active_pipeline_requires_agent_generated_scene_code(self):
         scene = {
             "scene_number": 1,
             "headline": "大气中的光",
@@ -88,12 +330,32 @@ class SciencePipelineTests(unittest.TestCase):
             "chips": ["光", "大气"],
             "steps": ["入射", "碰撞", "散射"],
         }
-        result = apply_creative_plan([scene], {"scenes": []})
-        self.assertEqual(result[0]["motif"], "particle_scatter")
+        with self.assertRaisesRegex(ValueError, "缺少逐幕 Agent"):
+            apply_creative_plan([scene], {"scenes": []})
 
-    def test_nature_specific_motif_is_rejected_for_software_topic(self):
-        self.assertFalse(motif_matches_subject("atmospheric_globe", "智能体在权限边界内循环执行任务"))
-        self.assertTrue(motif_matches_subject("atmospheric_globe", "阳光穿过地球大气层"))
+        result = apply_creative_plan([scene], {"scenes": [{"scene_number": 1, "scene_code": generated_scene_code(1)}]})
+        self.assertIn("s01-stage", render_agent_scene_markup(result[0]))
+
+    def test_scene_code_rejects_legacy_template_markers(self):
+        code = generated_scene_code(1)
+        code["markup"] = code["markup"].replace("agent-scene-stage", "agent-scene-stage premium-stage")
+        with self.assertRaisesRegex(ValueError, "旧固定模板"):
+            validate_scene_code(1, code)
+
+    def test_scene_code_allows_local_svg_filter_but_rejects_external_css_url(self):
+        code = generated_scene_code(1)
+        code["css"] += " .s01-node{filter:url(#s01-glow)}"
+        validate_scene_code(1, code)
+        code["css"] += " .s01-stage{background:url(https://example.com/a.png)}"
+        with self.assertRaisesRegex(ValueError, "外部资源"):
+            validate_scene_code(1, code)
+
+    def test_scene_code_set_rejects_structural_duplicates(self):
+        first = {"scene_number": 1, "scene_code": generated_scene_code(1)}
+        second = {"scene_number": 2, "scene_code": generated_scene_code(2)}
+        self.assertEqual(scene_code_fingerprint(first["scene_code"]), scene_code_fingerprint(second["scene_code"]))
+        with self.assertRaisesRegex(ValueError, "近似相同"):
+            validate_scene_code_set([first, second])
 
     def test_caption_does_not_isolate_comma_lead_in(self):
         words = [
@@ -111,7 +373,19 @@ class SciencePipelineTests(unittest.TestCase):
         ]
         cues = build_subtitle_cues(words)
         self.assertEqual(len(cues), 1)
-        self.assertEqual(cues[0]["text"], "海水不断蒸发，盐分却大多留在海里。")
+        self.assertEqual(cues[0]["text"], "海水不断蒸发，盐分却大多留在海里")
+
+    def test_caption_breaks_at_natural_punctuation_and_hides_terminal_mark(self):
+        words = [
+            {"text": "太阳光包含可见光，", "start": 0.0, "end": 1.3},
+            {"text": "也包含红外线。", "start": 1.3, "end": 2.6},
+            {"text": "人眼只能看到其中一部分。", "start": 2.6, "end": 4.5},
+        ]
+        cues = build_subtitle_cues(words)
+        self.assertEqual(
+            [cue["text"] for cue in cues],
+            ["太阳光包含可见光", "也包含红外线", "人眼只能看到其中一部分"],
+        )
 
     def test_media_scenes_break_on_complete_sentences(self):
         words = [

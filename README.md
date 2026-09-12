@@ -9,12 +9,13 @@ FrameCraft-CN 把一个科普主题、一篇中文文案或一段音视频，转
 - 输入主题：DeepSeek 自动生成科普讲稿、章节、视觉主张和来源台账，再调用阿里云 TTS。
 - 输入文案：严格按照用户原文生成阿里云 TTS、字幕和视频，不改写正文。
 - 上传媒体：阿里云 ASR 转写音频或视频原音轨；最终成片完整使用原音频，不重新配音。
-- 多 Agent 设计：内容、视觉、时序专家并行调研，总导演建立艺术圣经，每个场景由独立 Agent 设计，整合 Agent 统一成片节奏。
-- 科学语义动画：每幕从十二种科学视觉母题中按内容选择独立构图，并保留入场、持续演化和退场衔接。
+- 多 Agent 设计与编码：内容、视觉、时序专家并行调研，总导演建立艺术圣经，每幕由独立 Agent 直接编写 SVG、HTML、CSS 与 GSAP，独立代码审查 Agent 验收后再整合。
+- 原创语义动画：逐幕源码必须针对当前内容建立独立构图，并包含入场、持续演化和退场；旧成片模板、固定母题换字和近似重复代码会被拒绝。
 - 固定来源标注：引用短注始终位于画布左下角安全位，不跟随场景构图漂移。
-- 真实 HyperFrames：本地 Renderer 调用 HyperFrames `--strict` 渲染 H.264/AAC MP4。
-- 双重验收：本地 `ffprobe` 检查流和完整时长，DeepSeek 视觉模型逐幕检查入场、中段、退场三帧。
+- 真实 HyperFrames：浏览器调用 HyperFrames 官方 runtime 确定性逐帧渲染，并通过 WebCodecs 输出 H.264/AAC MP4。
+- 双重验收：浏览器检查编码能力、时长与音视频轨，DeepSeek 视觉模型逐幕检查入场、中段、退场三帧。
 - 项目隔离：每个项目拥有独立素材、聊天、Agent 跟踪、工程和版本记录。
+- 初版后对话改片：对话 AI 读取当前工程代码和验收记录，判断用户需要完整重新生成还是局部微调，并由用户点击按钮后执行。
 - 工程留云端：服务器保存可复渲染工程，MP4 只在用户电脑生成和下载。
 - 自动清理：生产环境默认清理超过 24 小时且没有活动任务的项目资源。
 
@@ -48,14 +49,18 @@ React 网页工作台
        -> visual：视觉隐喻与语义运动
        -> timing：节奏、字幕和同屏密度
        -> art_director：DeepSeek Pro 制定全片艺术圣经和母题分配
-       -> scene_designer_N：每幕一个 DeepSeek Agent 并行设计角色、构图与动画节拍
-       -> code_director：DeepSeek Pro 合并逐幕方案并统一连续性
+       -> scene_designer_N：每幕一个 DeepSeek Agent 并行设计并编写 SVG/HTML/CSS/GSAP
+       -> scene_code_reviewer_N：逐幕检查语义、原创性、安全边界和可执行性
+       -> code_director：DeepSeek Pro 统一文字层级与连续性，不覆盖逐幕源码
        -> quality_critic：检查科学表达、场景差异和动态图形质量，不通过则触发一次完整修订
-  -> 生成 HyperFrames HTML、时间线、字幕和来源台账
-  -> 浏览器把工程包交给用户电脑的 FrameCraft Renderer
-  -> HyperFrames --strict 真实渲染
-  -> ffprobe 完整性检查 + 临时联系表视觉验收
+  -> 原样整合逐幕 Agent 源码，生成 HyperFrames HTML、时间线、字幕和来源台账
+  -> 浏览器下载 HyperFrames 工程包并安全解包到内存
+  -> HyperFrames 官方 runtime renderSeek 逐帧渲染
+  -> 浏览器 WebCodecs 编码 H.264/AAC + 临时联系表视觉验收
   -> MP4 在当前电脑预览和下载，服务器只保存工程
+  -> 初版后：对话 AI 读取最新工程，给出重新生成或微调按钮
+       -> 重新生成：整理用户需求给提示词 AI，完整生成新工程
+       -> 微调：对话 AI 修改现有 HyperFrames 工程文件后重新本地渲染
 ```
 
 `outputs/<project_id>/analysis/agent_trace.json` 保存 openJiuwen 团队拓扑、模型、耗时和结构化结果，用于确认每次任务真实经过多 Agent。
@@ -130,23 +135,7 @@ export FRAMECRAFT_RENDER_TARGET=local
 ./scripts/start-frontend.sh
 ```
 
-每台负责渲染的用户电脑还要启动本地 Renderer：
-
-```bash
-npm install
-npm run local-renderer
-```
-
-macOS/Linux 可运行 `./scripts/start-local-renderer.sh`，Windows 可运行 `scripts/start-local-renderer.cmd`。Renderer 只监听 `127.0.0.1:19186`，不接收 DeepSeek、DashScope Key 或服务器访问口令。公网工作台必须使用 HTTPS，浏览器首次访问回环服务时需要允许“本地网络访问”。
-
-正式域名建议配置来源白名单：
-
-```bash
-export FRAMECRAFT_LOCAL_RENDERER_ORIGINS='https://your-framecraft.example.com'
-export FRAMECRAFT_LOCAL_RENDERER_CRF=30
-```
-
-除健康检查外，API 默认需要访问口令。首次启动会生成权限为 `0600` 的 `backend/storage/access_token.txt`。浏览器通过一次性 URL 查询参数写入本地存储后会移除地址栏中的口令。
+访问者无需下载或启动任何辅助程序。公网工作台必须使用 HTTPS，并建议使用最新版 Chrome 或 Edge，以获得 WebCodecs 的 H.264/AAC 硬件编码支持。工程 ZIP、逐帧画布和 MP4 全部只存在于当前浏览器内存；页面关闭后，如未下载成片，本地临时结果会随页面释放。
 
 ## 网页流程
 
@@ -154,10 +143,12 @@ export FRAMECRAFT_LOCAL_RENDERER_CRF=30
 2. 设置画幅、目标时长和科学视觉风格；媒体模式进入工作台后上传文件。
 3. 点击“开始生成科普方案”，等待内容准备和 openJiuwen 多 Agent 分析。
 4. 查看方案并确认生成。
-5. 网页连接本地 Renderer，下载工程并执行 HyperFrames 严格渲染。
-6. 本机检查音视频流与完整时长，并按每幕入场、中段、退场生成临时联系表。
+5. 网页下载工程，在当前浏览器中调用 HyperFrames 官方 runtime 逐帧渲染并编码 MP4。
+6. 浏览器检查音视频轨与完整时长，并按每幕入场、中段、退场生成临时联系表。
 7. 云端视觉 Agent 验收后删除联系表；通过时 MP4 直接进入当前浏览器预览和下载。
-8. 在项目聊天中继续提出修改，当前项目 Agent 基于同一上下文生成新版本。
+8. 初版生成完成前，项目聊天只提示先完成初版；初版完成后，项目聊天由对话 AI 读取当前工程代码和验收记录，判断用户诉求。
+9. 需要整体重做时显示“重新生成”按钮，点击后把对话 AI 整理的需求交给提示词 AI 完整生成新版本。
+10. 只需局部修改时显示“微调”按钮，点击后由对话 AI 修改现有 HyperFrames 工程文件，再重新本地渲染和验收。
 
 ## 质量门槛
 
@@ -168,7 +159,13 @@ export FRAMECRAFT_LOCAL_RENDERER_CRF=30
 - 机制、尺度、对比、时间线和系统关系使用不同主视觉结构。
 - 关键节点逐个出现，并具有表达含义的持续运动。
 - 主视觉充分利用画幅，避免拥挤、遮挡与无意义空白。
-- HyperFrames 必须以 `--strict` 运行；视觉评分低于 82 时不登记通过版本。
+- HyperFrames 必须通过官方 runtime 的确定性 `renderSeek` 逐帧运行；视觉评分低于 82 时不登记通过版本。
+- 验收失败后保留本机可播放成片，在 Agent 对话中展示分数和问题；系统不会自动重画，只有用户明确说“重试”或点击“重试”按钮才把验收意见反馈给提示词 AI 并生成新版本。
+- 如果浏览器根本没有生成可播放 MP4，系统会把错误自动反馈给提示词 AI 修复工程，最多 3 次；超过上限后回到聊天说明问题。
+- 初版后对话改片由对话 AI 分流：完整重新生成交给提示词 AI，局部微调由对话 AI 修改现有工程文件。
+- 每幕必须保存独立源代码与生成、审查 Agent 身份；缺少源码或命中旧模板标记时立即停止。
+
+不可退让的实现边界见 [多 Agent 科普视频生成需求](docs/MULTI_AGENT_ANIMATION_REQUIREMENTS.md)。
 
 ## 测试
 
@@ -195,7 +192,7 @@ backend/venv-openjiuwen/bin/python scripts/run_science_ui_flow.py \
   --output benchmark-results/science-topic.mp4
 ```
 
-`--mode script` 时 `--input` 传完整文案；`--mode media` 时传音频或视频绝对路径。测试脚本连接真实 API、本地 Renderer 和真实 HyperFrames，不提供模拟成片。
+`--mode script` 时 `--input` 传完整文案；`--mode media` 时传音频或视频绝对路径。网页端验收必须使用真实 API、真实 HyperFrames runtime 与浏览器 WebCodecs，不提供模拟成片。
 
 ## 产物
 
@@ -209,10 +206,10 @@ outputs/<project_id>/
 
 ## 安全与保留
 
-- Renderer 只绑定回环地址，拒绝 ZIP 目录穿越，并在系统临时目录隔离执行。
+- 浏览器解包器规范化 ZIP 路径，不将工程脚本交给服务器执行；渲染 iframe 与页面业务状态隔离。
 - 服务端忽略云端渲染请求；MP4 不上传服务器，历史预览接口返回 `410`。
 - 服务器只接收临时联系表用于验收，接口结束后立即删除图片，只保存验收 JSON。
-- 同一时间只允许一个本地渲染任务，本机临时工程和 MP4 默认一小时后删除。
+- MP4 使用浏览器对象 URL 预览，仅在当前标签页生命周期内保留；用户主动下载后由用户设备自行管理。
 - 后端可执行 `FRAMECRAFT_RETENTION_HOURS=24 ./scripts/cleanup-expired.sh` 清理过期项目。
 - 来源 URL 只允许公开 HTTPS 地址，并拒绝内网目标和越界重定向。
 

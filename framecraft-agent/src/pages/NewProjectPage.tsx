@@ -56,6 +56,8 @@ export default function NewProjectPage() {
         keep_hyperframes: keepHyperframes,
       });
       navigate(`/studio?project=${p.id}`);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : '项目创建失败，请稍后重试');
     } finally {
       setSubmitting(false);
     }

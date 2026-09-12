@@ -78,6 +78,10 @@ def main() -> None:
                 page.screenshot(path=str(args.output.with_suffix(".failure.png")), full_page=True)
                 agent_text = page.locator("text=Agent").last.inner_text() if page.locator("text=Agent").count() else "请查看 Agent 对话"
                 raise RuntimeError(f"分析任务需要补充：{agent_text}")
+            if project.get("status") == "failed":
+                page.wait_for_timeout(800)
+                page.screenshot(path=str(args.output.with_suffix(".failure.png")), full_page=True)
+                raise RuntimeError("分析任务未通过 Agent 内部审查，请查看项目聊天中的完整原因。")
             page.wait_for_timeout(1000)
         else:
             page.screenshot(path=str(args.output.with_suffix(".timeout.png")), full_page=True)

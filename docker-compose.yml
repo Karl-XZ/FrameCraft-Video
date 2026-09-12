@@ -31,5 +31,5 @@ services:
     restart: unless-stopped
 
 # 说明：
-# - 默认由用户电脑上的 FrameCraft Renderer 执行 HyperFrames 严格渲染，云端只生成工程并验收回传成片。
+# - 浏览器下载工程后调用 HyperFrames runtime 与 WebCodecs 本地渲染；云端只生成工程并验收联系表。
 # - 后端在进程内以线程池跑 JobRunner，无需独立 worker；如需横向扩展可拆分。

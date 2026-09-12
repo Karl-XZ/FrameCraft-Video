@@ -2,7 +2,12 @@ import React from 'react';
 import { Upload, Zap } from 'lucide-react';
 import GradientButton from '../ui/GradientButton';
 
-export default function StudioEmptyState() {
+interface StudioEmptyStateProps {
+  onPrepare: () => void;
+  busy?: boolean;
+}
+
+export default function StudioEmptyState({ onPrepare, busy = false }: StudioEmptyStateProps) {
   return (
     <div className="flex flex-col items-center justify-center h-full gap-8">
       {/* Icon */}
@@ -20,9 +25,9 @@ export default function StudioEmptyState() {
       </div>
 
       <div className="flex items-center gap-4">
-        <GradientButton size="lg" className="rounded-xl px-8 py-4">
+        <GradientButton size="lg" className="rounded-xl px-8 py-4" onClick={onPrepare} disabled={busy}>
           <Upload className="w-4 h-4" />
-          准备科普方案
+          {busy ? '正在启动 Agent…' : '准备科普方案'}
         </GradientButton>
       </div>
 

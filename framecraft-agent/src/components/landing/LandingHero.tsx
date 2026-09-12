@@ -70,14 +70,14 @@ export default function LandingHero() {
             </p>
             <div className="flex items-center gap-4">
               <Link
-                to="/studio"
+                to="/projects/new"
                 className="gradient-btn px-7 py-3.5 rounded-xl text-base font-bold flex items-center gap-2 shadow-glow"
               >
                 <Zap className="w-4 h-4" />
                 开始生成科普视频
               </Link>
               <Link
-                to="/studio"
+                to="/projects/new"
                 className="flex items-center gap-2 px-5 py-3.5 rounded-xl text-base font-semibold glass hover:bg-white/[0.08] transition-colors text-text-secondary hover:text-text-main border border-white/10"
               >
                 <Play className="w-4 h-4" />

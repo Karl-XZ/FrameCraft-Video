@@ -7,8 +7,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from .agent_scene_code import validate_scene_code, validate_scene_code_set, write_scene_sources
 from .ingest import build_subtitle_cues, normalize_words
-from .premium_scene_renderer import PREMIUM_MOTIFS, premium_scene_css, render_premium_scene
 
 
 def materialize_science_video_version(
@@ -24,6 +24,8 @@ def materialize_science_video_version(
     scene_seed = _load_json(prepared.scene_seed_path)
     scenes = _build_scene_specs(project, scene_seed, cues, prepared.source_text)
     scenes = apply_creative_plan(scenes, creative_plan or {})
+    validate_scene_code_set(scenes)
+    scene_source_manifest = write_scene_sources(version_dir, scenes)
     width, height = aspect_dimensions(str(project.get("aspect_ratio") or "9:16"))
     total_duration = max(
         float(scene_seed.get("total_duration_s") or 0),
@@ -32,7 +34,7 @@ def materialize_science_video_version(
         1.0,
     )
     timeline = build_timeline_payload(project, scenes, cues, total_duration)
-    html_text = render_html_document(
+    html_text = render_agent_html_document(
         project=project,
         scenes=scenes,
         cues=cues,
@@ -48,12 +50,16 @@ def materialize_science_video_version(
         encoding="utf-8",
     )
     (hyperframes_dir / "index.html").write_text(html_text, encoding="utf-8")
+    (hyperframes_dir / "scene-source-manifest.json").write_text(
+        json.dumps(scene_source_manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
 
     return {
         "duration_s": round(total_duration, 3),
         "scene_count": len(scenes),
         "caption_count": len(cues),
         "style_family": dominant_style_family(str(project.get("target_style") or ""), prepared.source_text),
+        "scene_code_count": len(scene_source_manifest),
     }
 
 
@@ -94,6 +100,8 @@ def build_science_video_analysis(project: dict[str, Any], prepared: Any) -> dict
                 "chips": scene["chips"],
                 "quote": scene["quote"],
                 "source_label": scene.get("source_label"),
+                "code_generator": scene.get("code_generator"),
+                "code_reviewer": scene.get("code_reviewer"),
             }
             for scene in scenes
         ],
@@ -193,6 +201,8 @@ def build_timeline_payload(
                 "chips": scene["chips"],
                 "elements": scene["elements"],
                 "source_label": scene.get("source_label"),
+                "code_generator": scene.get("code_generator"),
+                "code_reviewer": scene.get("code_reviewer"),
             }
         )
     return {
@@ -245,6 +255,10 @@ def render_html_document(
     secondary = safe_css_color(theme.get("secondary"), "#41e5b5")
     accent = safe_css_color(theme.get("accent"), "#ffb35c")
     scene_markup = "\n".join(render_scene_markup(scene, width, height) for scene in scenes)
+    agent_scene_css = "\n".join(
+        validate_scene_code(int(scene["scene_number"]), scene.get("scene_code"))["css"] for scene in scenes
+    )
+    agent_timeline_js = "\n".join(render_agent_timeline_call(scene) for scene in scenes)
     caption_markup = "\n".join(
         f'<div id="caption-{int(cue["index"]):03d}" class="caption-line">{html.escape(str(cue["text"]))}</div>'
         for cue in cues
@@ -268,7 +282,6 @@ def render_html_document(
     )
     title = html.escape(str(project.get("name") or "科普视频"))
     layout_css = _layout_css(width, height)
-    premium_css = premium_scene_css(width, height, theme)
     return f"""<!doctype html>
 <html lang="zh-CN">
   <head>
@@ -767,6 +780,15 @@ def render_html_document(
         text-shadow: 0 2px 10px rgba(0,0,0,.8);
         z-index: 24;
       }}
+      .agent-scene-stage {{
+        position: absolute;
+        left: 0;
+        right: 0;
+        top: {285 if height > width else 250}px;
+        bottom: {105 if height > width else 70}px;
+        overflow: hidden;
+        isolation: isolate;
+      }}
       {layout_css}
       .caption-shell {{
         position: absolute;
@@ -828,7 +850,7 @@ def render_html_document(
       @keyframes flowAcross {{ 0% {{ left: 2%; opacity: 0; }} 12% {{ opacity: 1; }} 88% {{ opacity: 1; }} 100% {{ left: 92%; opacity: 0; }} }}
       @keyframes ringBreathe {{ 0%,100% {{ transform: scale(.96); opacity: .4; }} 50% {{ transform: scale(1.04); opacity: .92; }} }}
       @keyframes orbitSpin {{ to {{ transform: rotate(360deg); }} }}
-      {premium_css}
+      {agent_scene_css}
     </style>
   </head>
   <body>
@@ -865,92 +887,13 @@ def render_html_document(
         if (document.querySelector(selector)) tl.fromTo(selector, fromVars, toVars, at);
       }};
 
-      setIfPresent(".headline, .subline, .chip, .process-board, .data-board, .knowledge-board, .story-board, .science-board, .premium-stage, .pm-beat", {{
-        autoAlpha: 0
-      }});
-      setIfPresent(".process-step, .metric-card, .bar-card, .satellite, .story-card, .story-dot", {{
+      setIfPresent(".headline, .subline, .chip", {{
         autoAlpha: 0
       }});
       scenes.forEach((scene) => {{
         const base = "#" + scene.id;
         tl.fromTo(base + " .headline", {{ y: 34, autoAlpha: 0 }}, {{ y: 0, autoAlpha: 1, duration: 0.75, ease: "power3.out" }}, scene.start + 0.08);
         tl.fromTo(base + " .subline", {{ y: 28, autoAlpha: 0 }}, {{ y: 0, autoAlpha: 1, duration: 0.65, ease: "power2.out" }}, scene.start + 0.22);
-        fromToIfPresent(base + " .chip", {{ y: 18, autoAlpha: 0 }}, {{ y: 0, autoAlpha: 1, duration: 0.48, stagger: 0.08, ease: "power2.out" }}, scene.start + 0.3);
-        const premium = document.querySelector(base + " .premium-stage");
-        if (premium) {{
-          tl.fromTo(base + " .premium-stage", {{ y: 34, autoAlpha: 0 }}, {{ y: 0, autoAlpha: 1, duration: 0.85, ease: "power3.out" }}, scene.start + 0.18);
-          tl.fromTo(base + " .pm-beat", {{ autoAlpha: 0, filter: "blur(10px)" }}, {{ autoAlpha: 1, filter: "blur(0px)", duration: 0.62, stagger: 0.13, ease: "power2.out" }}, scene.start + 0.48);
-          const motionStart = scene.start + 0.55;
-          const motionDuration = Math.max(1.4, scene.end - motionStart - 0.55);
-          const motif = scene.motif || "";
-          tl.to(base + " .pm-label", {{ y: -14, duration: motionDuration, stagger: 0.08, ease: "sine.inOut" }}, motionStart);
-          if (motif === "spectrum_prism") {{
-            tl.fromTo(base + " .pm-input-beam", {{ clipPath: "inset(0 100% 0 0)" }}, {{ clipPath: "inset(0 0% 0 0)", duration: Math.min(1.6, motionDuration * 0.24), ease: "power2.out" }}, motionStart);
-            tl.fromTo(base + " .pm-spectrum-ray", {{ clipPath: "inset(0 100% 0 0)", opacity: 0.48 }}, {{ clipPath: "inset(0 0% 0 0)", opacity: 1, duration: motionDuration, stagger: 0.08, ease: "power1.inOut" }}, motionStart + 0.45);
-          }} else if (motif === "particle_scatter") {{
-            tl.to(base + " .pm-path", {{ strokeDashoffset: -420, duration: motionDuration, ease: "none" }}, motionStart);
-            tl.to(base + " .pm-molecule", {{ x: 120, y: -68, duration: motionDuration, stagger: 0.16, ease: "sine.inOut" }}, motionStart);
-          }} else if (motif === "atmospheric_globe") {{
-            tl.to(base + " .pm-photon", {{ x: 170, y: -105, opacity: 0.32, duration: motionDuration, stagger: 0.14, ease: "power1.inOut" }}, motionStart);
-            tl.to(base + " .pm-atmo-ray", {{ strokeDashoffset: -520, opacity: 0.48, duration: motionDuration, stagger: 0.12, ease: "none" }}, motionStart);
-            tl.to(base + " .pm-sun", {{ scale: 1.12, filter: "brightness(1.25)", duration: motionDuration, ease: "sine.inOut" }}, motionStart);
-          }} else if (motif === "horizon_path") {{
-            tl.to(base + " .pm-path", {{ strokeDashoffset: -520, duration: motionDuration, ease: "none" }}, motionStart);
-            tl.to(base + " .pm-sun", {{ x: 300, y: 48, scale: 0.72, duration: motionDuration, ease: "power1.inOut" }}, motionStart);
-          }} else if (motif === "split_synthesis" || motif === "field_comparison") {{
-            tl.fromTo(base + " .pm-flow-line", {{ clipPath: "inset(0 100% 0 0)" }}, {{ clipPath: "inset(0 0% 0 0)", duration: motionDuration, stagger: 0.2, ease: "power1.inOut" }}, motionStart);
-            tl.to(base + " .pm-side.cool", {{ opacity: 0.78, boxShadow: "0 20px 60px rgba(89,200,255,.38)", duration: motionDuration, ease: "sine.inOut" }}, motionStart);
-            tl.to(base + " .pm-side.warm", {{ boxShadow: "0 20px 85px rgba(255,118,90,.58)", duration: motionDuration, ease: "sine.inOut" }}, motionStart);
-            tl.to(base + " .pm-cool-particle", {{ x: 130, y: -75, opacity: 0.08, duration: motionDuration, stagger: 0.12, ease: "power1.in" }}, motionStart);
-            tl.to(base + " .pm-warm-core", {{ scale: 1.7, filter: "brightness(1.28)", duration: motionDuration, ease: "sine.inOut" }}, motionStart);
-          }} else if (motif === "cell_network") {{
-            tl.to(base + " .pm-cell", {{ x: 28, y: -32, rotation: 8, duration: motionDuration, stagger: 0.12, ease: "sine.inOut" }}, motionStart);
-            tl.to(base + " .pm-path", {{ strokeDashoffset: -360, duration: motionDuration, ease: "none" }}, motionStart);
-          }} else if (motif === "orbital_system") {{
-            tl.to(base + " .pm-node", {{ y: -72, scale: 1.16, duration: motionDuration, stagger: 0.16, ease: "sine.inOut" }}, motionStart);
-            tl.to(base + " .pm-layer", {{ opacity: 0.42, borderColor: "rgba(255,211,106,.72)", duration: motionDuration, stagger: 0.1, ease: "sine.inOut" }}, motionStart);
-          }} else if (motif === "layered_scale") {{
-            tl.to(base + " .pm-node", {{ x: 72, rotation: 240, duration: motionDuration, stagger: 0.18, ease: "sine.inOut" }}, motionStart);
-            tl.to(base + " .pm-boundary-inner", {{ borderColor: "rgba(98,226,189,.9)", boxShadow: "inset 0 0 90px rgba(98,226,189,.2)", duration: motionDuration, ease: "sine.inOut" }}, motionStart);
-          }} else if (motif === "flow_machine") {{
-            tl.to(base + " .pm-path", {{ strokeDashoffset: -520, duration: motionDuration, ease: "none" }}, motionStart);
-            tl.to(base + " .pm-packet", {{ x: 720, opacity: 0.18, duration: motionDuration, stagger: 0.18, ease: "power1.inOut" }}, motionStart);
-            tl.fromTo(base + " .pm-tool", {{ x: 75, opacity: 0.35 }}, {{ x: 0, opacity: 1, duration: motionDuration, stagger: 0.18, ease: "power2.out" }}, motionStart);
-          }} else if (motif === "timeline_curve") {{
-            tl.to(base + " .pm-path", {{ strokeDashoffset: -520, duration: motionDuration, ease: "none" }}, motionStart);
-            tl.to(base + " .pm-node", {{ y: -58, scale: 1.13, duration: motionDuration, stagger: 0.24, ease: "power1.inOut" }}, motionStart);
-            tl.fromTo(base + " .pm-memory-vault span", {{ y: 44, opacity: 0 }}, {{ y: 0, opacity: 1, duration: motionDuration * 0.72, stagger: 0.28, ease: "power2.out" }}, motionStart + 0.5);
-          }} else if (motif === "data_landscape") {{
-            tl.fromTo(base + " .pm-data-bar", {{ scaleY: 0.28, transformOrigin: "bottom" }}, {{ scaleY: 1, duration: motionDuration, stagger: 0.18, ease: "power2.inOut" }}, motionStart);
-          }}
-          tl.to(base + " .premium-stage", {{ autoAlpha: 0, y: -24, duration: 0.42, ease: "power1.in" }}, Math.max(scene.start + 1, scene.end - 0.46));
-        }} else {{
-          fromToIfPresent(base + " .science-board", {{ scale: 0.96, y: 34, autoAlpha: 0 }}, {{ scale: 1, y: 0, autoAlpha: 1, duration: 0.82, ease: "power3.out" }}, scene.start + 0.2);
-          fromToIfPresent(base + " .science-label", {{ y: 18, autoAlpha: 0 }}, {{ y: 0, autoAlpha: 1, duration: 0.5, stagger: 0.16, ease: "power2.out" }}, scene.start + 0.48);
-        }}
-
-        if (!premium && scene.variant === "process") {{
-          fromToIfPresent(base + " .process-board", {{ x: 56, autoAlpha: 0 }}, {{ x: 0, autoAlpha: 1, duration: 0.7, ease: "power3.out" }}, scene.start + 0.22);
-          fromToIfPresent(base + " .process-step", {{ x: 22, autoAlpha: 0 }}, {{ x: 0, autoAlpha: 1, duration: 0.55, stagger: 0.22, ease: "power2.out" }}, scene.start + 0.38);
-        }}
-        if (!premium && scene.variant === "data") {{
-          fromToIfPresent(base + " .data-board", {{ x: 56, autoAlpha: 0 }}, {{ x: 0, autoAlpha: 1, duration: 0.72, ease: "power3.out" }}, scene.start + 0.18);
-          fromToIfPresent(base + " .metric-card", {{ y: 24, autoAlpha: 0 }}, {{ y: 0, autoAlpha: 1, duration: 0.5, stagger: 0.14, ease: "power2.out" }}, scene.start + 0.38);
-          Array.from({{ length: scene.valueCount }}).forEach((_, idx) => {{
-            const sel = base + " .bar-card.bar-" + idx;
-            tl.fromTo(sel, {{ y: 28, autoAlpha: 0 }}, {{ y: 0, autoAlpha: 1, duration: 0.48, ease: "power2.out" }}, scene.start + 0.6 + idx * 0.16);
-            tl.fromTo(sel + " .bar", {{ height: 0 }}, {{ height: sel && document.querySelector(sel + " .bar") ? document.querySelector(sel + " .bar").dataset.targetHeight : 0, duration: 0.65, ease: "power2.out" }}, scene.start + 0.72 + idx * 0.16);
-          }});
-        }}
-        if (!premium && scene.variant === "knowledge") {{
-          fromToIfPresent(base + " .knowledge-board", {{ x: 56, autoAlpha: 0 }}, {{ x: 0, autoAlpha: 1, duration: 0.72, ease: "power3.out" }}, scene.start + 0.16);
-          fromToIfPresent(base + " .satellite", {{ scale: 0.92, autoAlpha: 0 }}, {{ scale: 1, autoAlpha: 1, duration: 0.52, stagger: 0.18, ease: "power2.out" }}, scene.start + 0.52);
-        }}
-        if (!premium && scene.variant === "story") {{
-          fromToIfPresent(base + " .story-board", {{ x: 58, autoAlpha: 0 }}, {{ x: 0, autoAlpha: 1, duration: 0.72, ease: "power3.out" }}, scene.start + 0.18);
-          fromToIfPresent(base + " .story-card, " + base + " .story-dot", {{ y: 24, autoAlpha: 0 }}, {{ y: 0, autoAlpha: 1, duration: 0.52, stagger: 0.16, ease: "power2.out" }}, scene.start + 0.42);
-        }}
-
         tl.to(base + " .headline, " + base + " .subline, " + base + " .chip", {{
           autoAlpha: 0,
           y: -22,
@@ -958,6 +901,8 @@ def render_html_document(
           ease: "power1.in"
         }}, Math.max(scene.start + 0.9, scene.end - 0.42));
       }});
+
+      {agent_timeline_js}
 
       cues.forEach((cue) => {{
         const selector = "#caption-" + String(cue.index).padStart(3, "0");
@@ -970,15 +915,112 @@ def render_html_document(
 """
 
 
+def render_agent_html_document(
+    project: dict[str, Any],
+    scenes: list[dict[str, Any]],
+    cues: list[dict[str, Any]],
+    width: int,
+    height: int,
+    duration_s: float,
+    audio_asset_name: str,
+    theme: dict[str, Any] | None = None,
+) -> str:
+    theme = theme or {}
+    background = safe_css_color(theme.get("background"), "#07111f")
+    primary = safe_css_color(theme.get("primary"), "#7cb4ff")
+    secondary = safe_css_color(theme.get("secondary"), "#41e5b5")
+    accent = safe_css_color(theme.get("accent"), "#ffb35c")
+    scene_markup = "\n".join(render_scene_markup(scene, width, height) for scene in scenes)
+    agent_css = "\n".join(
+        validate_scene_code(int(scene["scene_number"]), scene.get("scene_code"))["css"] for scene in scenes
+    )
+    agent_timeline = "\n".join(render_agent_timeline_call(scene) for scene in scenes)
+    caption_markup = "\n".join(
+        f'<div id="caption-{int(cue["index"]):03d}" class="caption-line">{html.escape(str(cue["text"]))}</div>'
+        for cue in cues
+    )
+    cue_js = json.dumps(cues, ensure_ascii=False)
+    title = html.escape(str(project.get("name") or "科普视频"))
+    portrait = height > width
+    scene_pad_x = 58 if portrait else 88
+    scene_pad_top = 104 if portrait else 70
+    scene_pad_bottom = 190 if portrait else 150
+    visual_top = 300 if portrait else 225
+    caption_bottom = 100 if portrait else 84
+    caption_size = 46 if width < 1400 else 38
+    headline_size = 72 if portrait else 64
+    subline_size = 33 if portrait else 24
+    source_left = -scene_pad_x + 32
+    source_bottom = -scene_pad_bottom + 32
+    return f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width={width}, height={height}" />
+  <title>{title}</title>
+  <script src="https://cdn.jsdelivr.net/npm/gsap@3.14.2/dist/gsap.min.js"></script>
+  <style>
+    @font-face {{ font-family:"FrameCraft Sans"; src:local("PingFang SC"),local("Microsoft YaHei"),local("Noto Sans CJK SC"); font-weight:400 900; font-display:block; }}
+    @font-face {{ font-family:"PingFang SC"; src:local("PingFang SC"); font-weight:400 900; font-display:block; }}
+    @font-face {{ font-family:"Microsoft YaHei"; src:local("Microsoft YaHei"); font-weight:400 900; font-display:block; }}
+    @font-face {{ font-family:"Noto Sans CJK SC"; src:local("Noto Sans CJK SC"); font-weight:400 900; font-display:block; }}
+    @font-face {{ font-family:"Hiragino Sans GB"; src:local("Hiragino Sans GB"); font-weight:400 900; font-display:block; }}
+    @font-face {{ font-family:"Source Han Sans SC"; src:local("Source Han Sans SC"); font-weight:400 900; font-display:block; }}
+    * {{ box-sizing:border-box; margin:0; padding:0; }}
+    html,body,#root {{ width:{width}px; height:{height}px; overflow:hidden; background:{background}; }}
+    body {{ font-family:"FrameCraft Sans",sans-serif; color:#f4f8ff; }}
+    .canvas {{ position:absolute; inset:0; overflow:hidden; background:radial-gradient(circle at 16% 12%,color-mix(in srgb,{primary} 24%,transparent),transparent 32%),radial-gradient(circle at 84% 82%,color-mix(in srgb,{secondary} 18%,transparent),transparent 30%),linear-gradient(145deg,{background},color-mix(in srgb,{background} 88%,{primary})); }}
+    .scene {{ position:absolute; inset:0; padding:{scene_pad_top}px {scene_pad_x}px {scene_pad_bottom}px; overflow:hidden; }}
+    .scene-shell {{ position:relative; width:100%; height:100%; }}
+    .headline {{ position:absolute; left:0; top:0; z-index:30; max-width:82%; font-size:{headline_size}px; line-height:1.06; font-weight:850; letter-spacing:-.035em; }}
+    .subline {{ position:absolute; left:0; top:{100 if portrait else 82}px; z-index:30; max-width:76%; font-size:{subline_size}px; line-height:1.42; color:rgba(235,242,255,.78); }}
+    .chip-row,.quote-card {{ display:none; }}
+    .agent-scene-stage {{ position:absolute; left:0; right:0; top:{visual_top}px; bottom:0; overflow:hidden; isolation:isolate; }}
+    .source-line {{ position:absolute; left:{source_left}px; bottom:{source_bottom}px; z-index:40; width:46%; max-width:860px; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; font-size:{26 if portrait else 24}px; line-height:1.35; color:rgba(240,247,255,.82); text-shadow:0 2px 10px rgba(0,0,0,.8); }}
+    .caption-shell {{ position:absolute; left:50%; bottom:{caption_bottom}px; transform:translateX(-50%); z-index:50; width:min(90%,{820 if portrait else 1300}px); display:grid; pointer-events:none; }}
+    .caption-line {{ grid-area:1/1; justify-self:center; visibility:hidden; opacity:0; max-width:100%; padding:16px 26px; border-radius:999px; background:rgba(5,10,24,.72); border:1px solid rgba(255,255,255,.12); box-shadow:0 22px 50px rgba(0,0,0,.22); text-align:center; font-size:{caption_size}px; line-height:1.42; font-weight:750; color:#f8fbff; }}
+    {agent_css}
+  </style>
+</head>
+<body>
+  <div id="root" data-composition-id="main" data-start="0" data-duration="{duration_s:.3f}" data-width="{width}" data-height="{height}">
+    <div class="canvas">
+      {scene_markup}
+      <div id="centered-subtitles" class="caption-shell clip" data-start="0" data-duration="{duration_s:.3f}">{caption_markup}</div>
+    </div>
+    <audio id="narration" src="assets/{html.escape(audio_asset_name)}" preload="auto" data-start="0"></audio>
+  </div>
+  <script>
+    window.__timelines=window.__timelines||{{}};
+    const tl=gsap.timeline({{paused:true}});
+    window.__timelines.main=tl;
+    const cues={cue_js};
+    document.querySelectorAll(".headline,.subline").forEach((node)=>gsap.set(node,{{autoAlpha:0}}));
+    {agent_timeline}
+    {json.dumps([{"id": scene["scene_id"], "start": scene["start"], "end": scene["end"]} for scene in scenes], ensure_ascii=False)}.forEach((scene)=>{{
+      const base="#"+scene.id;
+      tl.fromTo(base+" .headline",{{y:30,autoAlpha:0}},{{y:0,autoAlpha:1,duration:.68,ease:"power3.out"}},scene.start+.06);
+      tl.fromTo(base+" .subline",{{y:20,autoAlpha:0}},{{y:0,autoAlpha:1,duration:.55,ease:"power2.out"}},scene.start+.18);
+      tl.to(base+" .headline, "+base+" .subline",{{y:-18,autoAlpha:0,duration:.3,ease:"power1.in"}},Math.max(scene.start+.8,scene.end-.36));
+    }});
+    cues.forEach((cue)=>{{
+      const selector="#caption-"+String(cue.index).padStart(3,"0");
+      tl.fromTo(selector,{{autoAlpha:0,y:12}},{{autoAlpha:1,y:0,duration:.16,ease:"power1.out"}},cue.start);
+      tl.to(selector,{{autoAlpha:0,y:-10,duration:.18,ease:"power1.in"}},Math.max(cue.start+.18,cue.end-.16));
+    }});
+  </script>
+</body>
+</html>
+"""
+
+
 def render_scene_markup(scene: dict[str, Any], width: int, height: int) -> str:
     quote = html.escape(scene["quote"])
     chips = "\n".join(f'<div class="chip">{html.escape(text)}</div>' for text in scene["chips"][:4])
-    main = render_variant_markup(scene, width, height)
+    main = render_agent_scene_markup(scene)
     source = f'<div class="source-line">{html.escape(scene["source_label"])}</div>' if scene.get("source_label") else ""
-    motif = str(scene.get("motif") or "")
-    premium_class = f" premium-scene motif-{motif}" if motif in PREMIUM_MOTIFS else ""
     return f"""
-<section id="{html.escape(scene['scene_id'])}" class="scene clip variant-{scene['variant']} layout-{scene['layout']} scene-order-{scene['scene_number']}{premium_class}" data-start="{scene['start']:.3f}" data-duration="{scene['duration']:.3f}">
+<section id="{html.escape(scene['scene_id'])}" class="scene clip variant-{scene['variant']} layout-{scene['layout']} scene-order-{scene['scene_number']} agent-generated-scene" data-start="{scene['start']:.3f}" data-duration="{scene['duration']:.3f}">
   <div class="scene-shell">
     <div class="headline">{html.escape(scene['headline'])}</div>
     <div class="subline">{html.escape(scene['subline'])}</div>
@@ -991,13 +1033,34 @@ def render_scene_markup(scene: dict[str, Any], width: int, height: int) -> str:
 """
 
 
+def render_agent_scene_markup(scene: dict[str, Any]) -> str:
+    number = int(scene.get("scene_number") or 0)
+    return validate_scene_code(number, scene.get("scene_code"))["markup"]
+
+
+def render_agent_timeline_call(scene: dict[str, Any]) -> str:
+    number = int(scene.get("scene_number") or 0)
+    code = validate_scene_code(number, scene.get("scene_code"))["timeline_js"]
+    scene_id = json.dumps(str(scene["scene_id"]))
+    start = float(scene["start"])
+    end = float(scene["end"])
+    duration = float(scene["duration"])
+    return f"""
+      (() => {{
+        const root = document.getElementById({scene_id});
+        if (!root) throw new Error("Missing generated scene root: " + {scene_id});
+        const q = (selector) => root.querySelector(selector);
+        const qa = (selector) => Array.from(root.querySelectorAll(selector));
+        const sceneStart = {start:.3f};
+        const sceneEnd = {end:.3f};
+        const sceneDuration = {duration:.3f};
+        {code}
+      }})();
+"""
+
+
 def render_variant_markup(scene: dict[str, Any], width: int, height: int) -> str:
-    premium = render_premium_scene(scene)
-    if premium:
-        return premium
-    semantic = render_semantic_science_markup(scene)
-    if semantic:
-        return semantic
+    """Legacy renderer kept for archived projects; the active pipeline never calls it."""
     if scene["variant"] == "process":
         horizontal = width > height and scene.get("layout") in {"wide", "center"}
         step_gap = 172 if height > width else 116
@@ -1326,11 +1389,10 @@ def apply_creative_plan(scenes: list[dict[str, Any]], creative_plan: dict[str, A
     allowed_layouts = {"wide", "split-left", "split-right", "center"}
     previous_layout = ""
     layout_cycle = ["wide", "split-left", "center", "split-right"]
-    used_motifs: set[str] = set()
     for scene in scenes:
         item = overrides.get(int(scene["scene_number"]))
         if not item:
-            item = {}
+            raise ValueError(f"第 {scene['scene_number']} 幕缺少逐幕 Agent 设计结果。")
         variant = str(item.get("variant") or "")
         if variant in allowed_variants:
             scene["variant"] = variant
@@ -1343,9 +1405,6 @@ def apply_creative_plan(scenes: list[dict[str, Any]], creative_plan: dict[str, A
         if scene["layout"] == previous_layout:
             scene["layout"] = layout_cycle[(layout_cycle.index(previous_layout) + 1) % len(layout_cycle)]
         previous_layout = scene["layout"]
-        requested_motif = str(item.get("motif") or "").strip()
-        scene["motif"] = choose_premium_motif(scene, requested_motif, used_motifs)
-        used_motifs.add(scene["motif"])
         for key, max_len in (("headline", 20), ("subline", 32)):
             value = normalize_visible_text(str(item.get(key) or ""))[:max_len]
             if value:
@@ -1362,6 +1421,9 @@ def apply_creative_plan(scenes: list[dict[str, Any]], creative_plan: dict[str, A
         scene["actors"] = [value for value in item.get("actors") or [] if isinstance(value, dict)][:8]
         scene["composition"] = item.get("composition") if isinstance(item.get("composition"), dict) else {}
         scene["animation_beats"] = [value for value in item.get("animation_beats") or [] if isinstance(value, dict)][:8]
+        scene["scene_code"] = validate_scene_code(int(scene["scene_number"]), item.get("scene_code"))
+        scene["code_generator"] = str(item.get("code_generator") or f"scene_designer_{scene['scene_number']}")
+        scene["code_reviewer"] = str(item.get("code_reviewer") or f"scene_code_reviewer_{scene['scene_number']}")
         supplied_values = []
         for value in item.get("values") or []:
             if not isinstance(value, dict):
@@ -1382,46 +1444,8 @@ def apply_creative_plan(scenes: list[dict[str, Any]], creative_plan: dict[str, A
         scene["core_title"] = scene["chips"][0] if scene["chips"] else scene["headline"]
         scene["core_sub"] = scene["subline"]
         scene["elements"] = [{"kind": scene["variant"], "text": value} for value in scene["steps"]]
+    validate_scene_code_set(scenes)
     return scenes
-
-
-def choose_premium_motif(scene: dict[str, Any], requested: str, used: set[str]) -> str:
-    text = f"{scene.get('headline', '')}{scene.get('subline', '')}{scene.get('quote', '')}"
-    if requested in PREMIUM_MOTIFS and requested not in used and motif_matches_subject(requested, text):
-        return requested
-    candidates: list[str] = []
-    if re.search(r"白光|光谱|彩虹|颜色|波长", text):
-        candidates.append("spectrum_prism")
-    if re.search(r"分子|碰撞|散射|粒子", text):
-        candidates.append("particle_scatter")
-    if re.search(r"天空|大气|星球|地球|观察", text):
-        candidates.append("atmospheric_globe")
-    if re.search(r"日落|地平线|路径|路程|穿过", text):
-        candidates.append("horizon_path")
-    if re.search(r"权限|边界|限制|限定|范围", text):
-        candidates.append("layered_scale")
-    semantic = str(scene.get("semantic_motion") or "system")
-    candidates.extend(
-        {
-            "mechanism": ["flow_machine", "particle_scatter"],
-            "comparison": ["field_comparison", "split_synthesis"],
-            "scale": ["layered_scale", "data_landscape"],
-            "timeline": ["timeline_curve", "horizon_path"],
-            "system": ["orbital_system", "cell_network", "atmospheric_globe"],
-        }.get(semantic, ["orbital_system"])
-    )
-    candidates.extend(["split_synthesis", "timeline_curve", "flow_machine", "orbital_system"])
-    return next((motif for motif in candidates if motif not in used), candidates[0])
-
-
-def motif_matches_subject(motif: str, text: str) -> bool:
-    requirements = {
-        "spectrum_prism": r"光谱|白光|彩虹|颜色|波长|棱镜",
-        "atmospheric_globe": r"天空|大气|星球|地球|太阳|气候",
-        "horizon_path": r"日落|日出|地平线|太阳|大气路径",
-    }
-    pattern = requirements.get(motif)
-    return not pattern or bool(re.search(pattern, text))
 
 
 def _layout_css(width: int, height: int) -> str:

@@ -12,13 +12,18 @@ import requests
 from .deepseek_api import create_client, deepseek_settings, parse_json_object
 
 
+def _text_model() -> str:
+    settings = deepseek_settings()
+    return settings.get("text_model") or settings.get("pro_model") or "deepseek-v4-flash"
+
+
 def generate_science_brief(topic: str, requirements: str, target_duration: int) -> dict[str, Any]:
     topic = (topic or "").strip()
     if not topic:
         raise RuntimeError("主题模式需要填写科普主题。")
     target_chars = max(80, min(900, int(target_duration * 4.2)))
     response = create_client().chat.completions.create(
-        model=deepseek_settings()["pro_model"],
+        model=_text_model(),
         messages=[
             {
                 "role": "system",
@@ -64,7 +69,7 @@ def _fit_narration_length(brief: dict[str, Any], target_chars: int) -> dict[str,
     candidate = brief
     for attempt in range(2):
         response = create_client().chat.completions.create(
-            model=deepseek_settings()["pro_model"],
+            model=_text_model(),
             messages=[
                 {
                     "role": "system",

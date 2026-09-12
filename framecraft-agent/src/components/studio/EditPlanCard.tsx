@@ -63,7 +63,7 @@ export default function EditPlanCard() {
           </div>
           <div className="flex items-center gap-2 px-3 py-2 rounded-lg bg-secondary/8 border border-secondary/15">
             <Sparkles className="w-3.5 h-3.5 text-secondary" />
-            <span className="text-xs text-text-secondary">默认使用用户电脑 HyperFrames 真实渲染</span>
+            <span className="text-xs text-text-secondary">默认在当前浏览器执行 HyperFrames 真实渲染</span>
           </div>
         </div>
 
@@ -106,7 +106,7 @@ export default function EditPlanCard() {
       <div className="flex gap-3">
         <GradientButton size="lg" className="flex-1 rounded-xl" onClick={() => void startGenerate()} disabled={Boolean(activeJobId)}>
           <Sparkles className="w-4 h-4" />
-          {activeJobId ? 'Agent 任务运行中' : '确认生成并在本地渲染'}
+          {activeJobId ? 'Agent 任务运行中' : '确认生成并在浏览器渲染'}
         </GradientButton>
       </div>
     </div>

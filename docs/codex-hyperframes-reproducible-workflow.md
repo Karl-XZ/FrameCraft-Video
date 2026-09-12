@@ -89,7 +89,7 @@ Agent 必须生成 HyperFrames 工程并用 HyperFrames 真实渲染 `preview.mp
 - 搞笑类动画位置应按人物动作、视线、字幕和留白做构图，不得全部堆在左上角，也不得机械排成上中下或左右队列。
 - 没必要有底色的表情/贴纸应无底或透明；需要方框时必须是真圆角半透明卡片。
 - 非全屏版信息区密度足够，且没有遮挡人物。
-- `agent_visual_review.json` 存在且 `pass=true`；如果视觉复审主观认为不美观、不自然、不高级，即使无硬性遮挡也必须重做。
+- `agent_visual_review.json` 存在且 `pass=true`；如果视觉复审主观认为不美观、不自然、不高级，即使无硬性遮挡也不能登记通过。失败成片先展示给用户，用户明确要求重试后再重做。
 - `render_log.json` 中 `lint_ok=true`、`render_ok=true`。
 - 若项目开启 `generate_draft=true`，版本目录中必须存在 `jianying_draft.zip` 和 `jianying_draft_manifest.json`，前端 `draft_url` 必须指向真实下载路由。
 

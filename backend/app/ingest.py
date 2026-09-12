@@ -514,8 +514,17 @@ def build_subtitle_cues(words: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def merge_short_subtitle_cues(cues: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    pending = [dict(cue) for cue in cues]
+    if len(pending) > 1:
+        first = pending[0]
+        first_duration = float(first["end"]) - float(first["start"])
+        if first_duration < 0.7 or len(str(first["text"]).strip()) <= 2:
+            pending[1]["start"] = first["start"]
+            pending[1]["text"] = join_words([{"text": first["text"]}, {"text": pending[1]["text"]}])
+            pending.pop(0)
+
     merged: list[dict[str, Any]] = []
-    for cue in cues:
+    for cue in pending:
         duration = float(cue["end"]) - float(cue["start"])
         text = str(cue["text"])
         if merged and (duration < 0.7 or len(text.strip()) <= 2):
@@ -526,6 +535,9 @@ def merge_short_subtitle_cues(cues: list[dict[str, Any]]) -> list[dict[str, Any]
         merged.append(dict(cue))
     for index, cue in enumerate(merged, start=1):
         cue["index"] = index
+        cleaned = re.sub(r"[，。！？；：,.!?;:、…]+$", "", str(cue["text"]).strip()).strip()
+        if cleaned:
+            cue["text"] = cleaned
     return merged
 
 
@@ -666,7 +678,7 @@ def ends_scene_sentence(text: str) -> bool:
 
 
 def ends_caption_sentence(text: str) -> bool:
-    return bool(re.search(r"[。！？!?；;]$", text))
+    return bool(re.search(r"[。！？!?；;，,：:]$", text))
 
 
 def join_words(words: list[dict[str, Any]]) -> str:

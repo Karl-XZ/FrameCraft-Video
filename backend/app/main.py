@@ -4,6 +4,7 @@ import asyncio
 import json
 import mimetypes
 import os
+import re
 import shutil
 import tempfile
 from pathlib import Path
@@ -17,7 +18,7 @@ from pydantic import BaseModel
 from . import store
 from .ingest import ensure_version_subtitles, read_script_text, write_script_text
 from .retention import startup_prune_if_enabled
-from .security import cors_origin_regex, cors_origins, get_access_token, require_access_token, token_help
+from .security import cors_origin_regex, cors_origins
 from .single_agent import ProjectBusyError, runner
 
 app = FastAPI(title="FrameCraft openJiuwen Agent API")
@@ -28,18 +29,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-app.middleware("http")(require_access_token)
-
-
-@app.on_event("startup")
-def startup_security_notice():
-    if os.getenv("FRAMECRAFT_DISABLE_AUTH", "").strip() in {"1", "true", "yes"}:
-        print("[FrameCraft] WARNING auth disabled by FRAMECRAFT_DISABLE_AUTH", flush=True)
-    else:
-        get_access_token()
-        print(f"[FrameCraft] Access token source: {token_help()}", flush=True)
-
-
 @app.on_event("startup")
 def startup_retention_pass():
     try:
@@ -129,11 +118,21 @@ class ScriptIn(BaseModel):
     text: str = ""
 
 
+class ChatActionIn(BaseModel):
+    message_id: str | None = None
+
+
+class LocalRenderFailureIn(BaseModel):
+    error: str
+    attempt: int = 1
+    media_validation: dict[str, Any] = {}
+
+
 @app.get("/api/health")
 def health():
     return {
         "ok": True,
-        "mode": "openjiuwen-multi-agent",
+        "mode": "two-stage-prompt-animation",
         "default_render_target": "local",
         "server_stores_video": False,
     }
@@ -437,7 +436,7 @@ def activate_version(project_id: str, version_id: str):
 @app.get("/api/projects/{project_id}/versions/{version_id}/preview")
 def version_preview(project_id: str, version_id: str):
     _version(project_id, version_id)
-    raise HTTPException(410, "服务器不保存或提供成片，请下载工程并在用户电脑本地渲染。")
+    raise HTTPException(410, "服务器不保存或提供成片，请下载工程并在当前浏览器本地渲染。")
 
 
 @app.get("/api/projects/{project_id}/versions/{version_id}/timeline")
@@ -516,6 +515,56 @@ async def review_local_render(
         temp_path.unlink(missing_ok=True)
 
 
+@app.post("/api/projects/{project_id}/versions/{version_id}/retry")
+def retry_local_render(project_id: str, version_id: str):
+    _version(project_id, version_id)
+    try:
+        return runner.retry_local_render(project_id, version_id)
+    except ProjectBusyError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.post("/api/projects/{project_id}/versions/{version_id}/regenerate")
+def regenerate_from_chat(project_id: str, version_id: str, body: ChatActionIn):
+    _version(project_id, version_id)
+    try:
+        return runner.regenerate_from_chat(project_id, version_id, body.message_id)
+    except ProjectBusyError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.post("/api/projects/{project_id}/versions/{version_id}/fine-tune")
+def fine_tune_from_chat(project_id: str, version_id: str, body: ChatActionIn):
+    _version(project_id, version_id)
+    try:
+        return runner.fine_tune_from_chat(project_id, version_id, body.message_id)
+    except ProjectBusyError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.post("/api/projects/{project_id}/versions/{version_id}/local-render-failed")
+def local_render_failed(project_id: str, version_id: str, body: LocalRenderFailureIn):
+    _version(project_id, version_id)
+    try:
+        return runner.retry_unplayable_render(
+            project_id,
+            version_id,
+            body.error.strip() or "浏览器本地渲染没有返回可播放 MP4。",
+            body.attempt,
+            body.media_validation,
+        )
+    except ProjectBusyError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
 @app.get("/api/projects/{project_id}/versions/{version_id}/draft")
 def version_draft(project_id: str, version_id: str):
     version = _version(project_id, version_id)
@@ -541,45 +590,52 @@ def import_guide(project_id: str, version_id: str):
 @app.post("/api/projects/{project_id}/chat")
 def chat(project_id: str, body: ChatIn):
     _ensure_project(project_id)
+    clean_message = body.message.strip()
+    if not clean_message:
+        raise HTTPException(400, "消息不能为空。")
     user = {
         "id": store.new_id("msg"),
         "role": "user",
-        "content": body.message,
+        "content": clean_message,
         "created_at": store.now_iso(),
     }
 
     def op(data):
         data.setdefault("chat", {}).setdefault(project_id, []).append(user)
     store.mutate(op)
+    retry_intent = re.fullmatch(
+        r"(?:请|麻烦)?\s*(?:重试|再试一次|retry)(?:\s*(?:一下|吧|这个版本|上一版))?[。！!]?",
+        clean_message.lower(),
+    )
+    if retry_intent:
+        failed_versions = [
+            version
+            for version in store.snapshot()["versions"].values()
+            if version.get("project_id") == project_id and version.get("status") == "local_render_failed"
+        ]
+        failed_versions.sort(key=lambda version: version.get("created_at") or "", reverse=True)
+        if failed_versions:
+            try:
+                job = runner.retry_local_render(project_id, failed_versions[0]["id"])
+            except (ProjectBusyError, RuntimeError) as exc:
+                raise HTTPException(409, str(exc)) from exc
+            message = store.snapshot().get("chat", {}).get(project_id, [])[-1]
+            message["job_id"] = job["id"]
+            return store.public_chat_message(message)
     try:
-        job = _start_job(project_id, "chat", {"message": body.message, "apply": body.apply})
-    except Exception:
+        return runner.propose_chat_action(project_id, clean_message)
+    except RuntimeError as exc:
         def failed_op(data):
             data.setdefault("chat", {}).setdefault(project_id, []).append({
                 "id": store.new_id("msg"),
                 "project_id": project_id,
                 "role": "agent",
-                "content": "这条消息已经收到，但 Agent 没能启动。请检查后端日志或 DeepSeek API 配置后重试。",
+                "content": f"这条消息已经收到，但对话 AI 没能完成判断：{exc}",
                 "status": "failed",
                 "created_at": store.now_iso(),
             })
         store.mutate(failed_op)
-        raise
-    accepted = {
-        "id": store.new_id("msg"),
-        "project_id": project_id,
-        "role": "agent",
-        "content": "已收到，我正在把这条消息交给当前项目的 Agent。后续进度会直接显示在这里。",
-        "patch": None,
-        "job_id": job["id"],
-        "status": "running",
-        "created_at": store.now_iso(),
-    }
-
-    def accepted_op(data):
-        data.setdefault("chat", {}).setdefault(project_id, []).append(accepted)
-    store.mutate(accepted_op)
-    return store.public_chat_message(accepted)
+        raise HTTPException(422, str(exc)) from exc
 
 
 @app.get("/api/projects/{project_id}/chat")

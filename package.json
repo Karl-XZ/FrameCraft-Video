@@ -1,9 +1,5 @@
 {
-  "scripts": {
-    "local-renderer": "node local-renderer/server.mjs"
-  },
   "dependencies": {
-    "adm-zip": "^0.5.16",
     "hyperframes": "0.7.41"
   }
 }

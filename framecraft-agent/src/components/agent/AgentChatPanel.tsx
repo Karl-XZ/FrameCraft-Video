@@ -7,16 +7,23 @@ import QuickActionChips from './QuickActionChips';
 import { useProjectStore } from '../../store/projectStore';
 import { useStudioWorkflow } from '../../hooks/useStudioWorkflow';
 
-const EMPTY_CHAT_HINT = `在下方输入消息，与 Agent 对话。
+const EMPTY_CHAT_HINT = `初版生成完成后，可以在这里与 Agent 对话修改视频。
 
-支持：调整解说节奏、修改字幕、加强图表动画、替换素材、调节音乐等。生成成片后可继续提出改片需求。`;
+初版前发送消息时，Agent 会提示先完成初版生成。`;
+
+function actionLabel(action?: string | null) {
+  if (action === 'retry_render') return '重试';
+  if (action === 'regenerate_video') return '重新生成';
+  if (action === 'fine_tune_video') return '微调';
+  return undefined;
+}
 
 export default function AgentChatPanel() {
   const [input, setInput] = useState('');
   const [sending, setSending] = useState(false);
   const bottomRef = useRef<HTMLDivElement | null>(null);
-  const { chatMessages, pendingPatch, versions, currentVersionId, chatBusy } = useProjectStore();
-  const { sendChat, acceptPatch, discardPatch, revertToPreviousVersion } = useStudioWorkflow();
+  const { projectId, chatMessages, pendingPatch, versions, currentVersionId, chatBusy } = useProjectStore();
+  const { sendChat, acceptPatch, discardPatch, revertToPreviousVersion, retryFailedRender, runChatAction } = useStudioWorkflow();
 
   const canRevert = versions.length > 1 && versions.findIndex((v) => v.id === currentVersionId) < versions.length - 1;
   const busy = sending || chatBusy;
@@ -25,16 +32,21 @@ export default function AgentChatPanel() {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
   }, [chatMessages.length, busy, pendingPatch]);
 
-  const handleSend = async () => {
-    const text = input.trim();
-    if (!text || busy) return;
-    setInput('');
+  const submitMessage = async (text: string) => {
+    const clean = text.trim();
+    if (!clean || busy || !projectId) return;
     setSending(true);
     try {
-      await sendChat(text);
+      await sendChat(clean);
     } finally {
       setSending(false);
     }
+  };
+
+  const handleSend = async () => {
+    const text = input;
+    setInput('');
+    await submitMessage(text);
   };
 
   return (
@@ -70,7 +82,18 @@ export default function AgentChatPanel() {
         ) : (
           <>
             {chatMessages.map((msg) => (
-              <ChatMessageBubble key={msg.id} role={msg.role} text={msg.text} />
+              <ChatMessageBubble
+                key={msg.id}
+                role={msg.role}
+                text={msg.text}
+                actionLabel={actionLabel(msg.action)}
+                actionDisabled={busy}
+                onAction={msg.versionId && msg.action === 'retry_render'
+                  ? () => void retryFailedRender(msg.versionId as string)
+                  : msg.versionId && (msg.action === 'regenerate_video' || msg.action === 'fine_tune_video')
+                    ? () => void runChatAction(msg.action as string, msg.versionId as string, msg.id)
+                    : undefined}
+              />
             ))}
             {busy && <AgentTypingIndicator />}
             <div ref={bottomRef} />
@@ -86,7 +109,7 @@ export default function AgentChatPanel() {
       </div>
 
       <div className="px-4 py-3 border-t border-white/8">
-        <QuickActionChips onSelect={(text) => !busy && setInput(text)} />
+        <QuickActionChips onSelect={(text) => void submitMessage(text)} />
       </div>
 
       <div className="px-4 py-3 border-t border-white/8">
@@ -96,14 +119,14 @@ export default function AgentChatPanel() {
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={(e) => e.key === 'Enter' && !busy && void handleSend()}
-            placeholder={busy ? 'Agent 思考中…' : '描述你想做的修改...'}
-            disabled={busy}
+            placeholder={!projectId ? '正在加载项目 Agent…' : busy ? 'Agent 思考中…' : '输入消息，按 Enter 发送...'}
+            disabled={busy || !projectId}
             className="flex-1 px-3 py-2 rounded-lg bg-white/5 border border-white/8 text-sm text-text-main placeholder:text-text-muted focus:outline-none focus:border-primary/40 disabled:opacity-60"
           />
           <button
             type="button"
             onClick={() => void handleSend()}
-            disabled={busy}
+            disabled={busy || !projectId || !input.trim()}
             className="gradient-btn px-3 py-2 rounded-lg flex items-center gap-1.5 disabled:opacity-60"
           >
             <Send className="w-3.5 h-3.5" />

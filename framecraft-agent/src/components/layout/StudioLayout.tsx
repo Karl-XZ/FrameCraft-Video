@@ -1,6 +1,6 @@
 import React from 'react';
 import { Link } from 'react-router-dom';
-import { Zap, Settings, Trash2, Sparkles, Play, FileJson, Layers } from 'lucide-react';
+import { Zap, Sparkles, FileJson, Layers } from 'lucide-react';
 import { useProjectStore } from '../../store/projectStore';
 import { useStudioWorkflow } from '../../hooks/useStudioWorkflow';
 import { api } from '../../api/client';
@@ -17,21 +17,18 @@ import VideoPreviewArea from '../studio/VideoPreviewArea';
 import DownloadResultCard from '../studio/DownloadResultCard';
 import MiniTimeline from '../studio/MiniTimeline';
 import AgentChatPanel from '../agent/AgentChatPanel';
-import ModelSettingsDrawer from '../settings/ModelSettingsDrawer';
 import AssetDetailDrawer from '../asset/AssetDetailDrawer';
-import ProjectSelector from '../layout/ProjectSelector';
 import GradientButton from '../ui/GradientButton';
 
 export default function StudioLayout() {
   const {
     step, assets, filter,
-    clearProject, setShowSettingsDrawer,
     setSelectedAssetId, setShowAssetDrawer,
     generateHyperFramesProgress, generateDraftProgress,
     versions, currentVersionId, setCurrentVersionId, setPreviewUrl, setVersion, previewUrl, error,
     activeJobId, scriptText, inputMode, topic, requirements,
   } = useProjectStore();
-  const { startAnalyze, saveScriptText } = useStudioWorkflow();
+  const { startAnalyze, startGenerate, saveScriptText } = useStudioWorkflow();
 
   const filteredAssets = filter === 'all' ? assets : assets.filter((a) => a.type === filter);
   const currentVersion = versions.find((v) => v.id === currentVersionId) || versions[0];
@@ -40,14 +37,8 @@ export default function StudioLayout() {
     switch (step) {
       case 'upload':
         return (
-          <div className="flex flex-col items-center gap-6 h-full justify-center">
-            <StudioEmptyState />
-            {((inputMode === 'topic' && topic.trim()) || (inputMode === 'script' && scriptText.trim()) || (inputMode === 'media' && assets.length > 0)) && (
-              <GradientButton size="lg" className="rounded-xl px-8" onClick={() => void startAnalyze()} disabled={Boolean(activeJobId)}>
-                <Play className="w-4 h-4" />
-                {activeJobId ? 'Agent 任务运行中' : '开始生成科普方案'}
-              </GradientButton>
-            )}
+          <div className="flex flex-col items-center h-full justify-center">
+            <StudioEmptyState onPrepare={() => void startAnalyze()} busy={Boolean(activeJobId)} />
           </div>
         );
       case 'analyze':
@@ -62,7 +53,7 @@ export default function StudioLayout() {
                 <div className="flex items-center justify-between mb-3">
                   <span className="text-sm font-semibold text-text-main flex items-center gap-2">
                     <Sparkles className="w-4 h-4 text-primary-light" />
-                    正在生成工程并由用户电脑渲染
+                    正在生成工程并由当前浏览器渲染
                   </span>
                   <span className="text-xs text-primary-light font-mono">{generateHyperFramesProgress}%</span>
                 </div>
@@ -91,6 +82,22 @@ export default function StudioLayout() {
             <div className="max-w-[280px] mx-auto">
               <VideoPreviewArea />
             </div>
+            {currentVersion?.status && ['awaiting_local_render', 'local_render_ready'].includes(currentVersion.status) && !previewUrl && (
+              <GradientButton
+                size="lg"
+                className="mx-auto rounded-xl"
+                onClick={() => void startGenerate()}
+                disabled={Boolean(activeJobId)}
+              >
+                <Zap className="w-4 h-4" />
+                在浏览器生成 MP4
+              </GradientButton>
+            )}
+            {currentVersion?.status === 'local_render_failed' && !previewUrl && (
+              <p className="mx-auto max-w-md text-center text-xs leading-relaxed text-text-muted">
+                这版成片未通过验收。若当前页面已刷新，本机临时视频需要重新生成后才能播放；请在 Agent 对话中查看评分和问题，并决定是否重试设计。
+              </p>
+            )}
             <div className="flex items-center gap-2 flex-wrap">
               <span className="text-xs text-text-muted">版本：</span>
               {versions.map((v) => (
@@ -170,15 +177,7 @@ export default function StudioLayout() {
           </Link>
         </div>
         <StepProgress />
-        <div className="flex items-center gap-2">
-          <ProjectSelector />
-          <button type="button" onClick={() => setShowSettingsDrawer(true)} className="flex items-center gap-2 px-3 py-1.5 rounded-lg glass border border-white/10 text-xs text-text-secondary">
-            <Settings className="w-3.5 h-3.5" /> 模型设置
-          </button>
-          <button type="button" onClick={clearProject} className="flex items-center gap-2 px-3 py-1.5 rounded-lg border border-white/8 text-xs text-text-muted hover:text-error">
-            <Trash2 className="w-3.5 h-3.5" /> 清空项目
-          </button>
-        </div>
+        <div className="w-32" aria-hidden="true" />
       </div>
 
       <div className="flex flex-1 min-h-0 overflow-hidden">
@@ -225,7 +224,6 @@ export default function StudioLayout() {
         </div>
       </div>
       <BottomStatusBar />
-      <ModelSettingsDrawer />
       <AssetDetailDrawer />
     </div>
   );

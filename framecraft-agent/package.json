@@ -10,8 +10,13 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "fflate": "^0.8.3",
     "framer-motion": "^12.40.0",
+    "gsap": "^3.15.0",
+    "hyperframes": "0.7.41",
     "lucide-react": "^1.18.0",
+    "mediabunny": "^1.56.1",
+    "modern-screenshot": "^4.7.0",
     "react": "^19.2.6",
     "react-dom": "^19.2.6",
     "react-router-dom": "^6.30.4",

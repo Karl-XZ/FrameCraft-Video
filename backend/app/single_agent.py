@@ -14,13 +14,14 @@ from typing import Any
 import json5
 from . import store
 from .ingest import PreparedSource, ensure_version_subtitles, prepare_source_bundle
-from .deepseek_api import create_client, deepseek_available, deepseek_settings
-from .jiuwen_team import run_creative_team, run_visual_review
-from .managed_faceless_builder import build_science_video_analysis, materialize_science_video_version
+from .deepseek_api import create_client, deepseek_available, deepseek_settings, parse_json_object
+from .jiuwen_team import run_visual_review
+from .two_stage_core import build_two_stage_analysis, materialize_two_stage_version
 
 TERMINAL_STATUSES = {"completed", "failed", "cancelled", "needs_input"}
 HYPERFRAMES_ROOT = store.ROOT.parent / "hyperframes"
 SCIENCE_WORKFLOW_DOC = store.ROOT / "docs" / "SCIENCE_VIDEO_WORKFLOW.md"
+PROMPTS_DIR = store.ROOT / "backend" / "app" / "prompts"
 FORBIDDEN_CMD_SNIPPETS = [
     "sudo ",
     "ssh ",
@@ -121,6 +122,8 @@ class SingleAgentRunner:
                 self._run_managed_analysis(job_id, prepared)
             elif job["type"] in {"generate", "apply_patch"}:
                 self._run_managed_render(job_id, prepared)
+            elif job["type"] == "fine_tune":
+                self._run_dialogue_fine_tune(job_id, prepared)
             else:
                 self._run_agent_loop(job_id, prepared)
             if not self._validate_outputs(job_id):
@@ -203,6 +206,44 @@ class SingleAgentRunner:
         version_count_after = len([v for v in post["versions"].values() if v["project_id"] == project_id])
         if job["type"] in {"generate", "apply_patch"} and version_count_after <= version_count_before:
             raise RuntimeError("Agent 对话结束了，但没有产出新的已注册版本。")
+
+    def propose_chat_action(self, project_id: str, message: str) -> dict[str, Any]:
+        snapshot = store.snapshot()
+        project = snapshot["projects"].get(project_id)
+        if not project:
+            raise RuntimeError("项目不存在。")
+        version = self._latest_interactive_version(project_id, snapshot)
+        if not version:
+            content = "请先完成初版生成并在当前浏览器生成一次 MP4，之后我就能基于成片和工程文件继续和你讨论修改。"
+            return self._append_chat_action(project_id, content, "needs_initial_generation", None, "", {})
+
+        context = self._dialogue_context(project_id, project, version, snapshot)
+        payload = {"user_message": message, "context": context}
+        response = create_client().chat.completions.create(
+            model=deepseek_settings()["text_model"],
+            messages=[
+                {"role": "system", "content": (PROMPTS_DIR / "dialogue_ai_system.md").read_text(encoding="utf-8")},
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+            ],
+            temperature=0.12,
+            max_tokens=1800,
+            extra_body={"thinking": {"type": "disabled"}},
+        )
+        decision = parse_json_object(response.choices[0].message.content)
+        intent = str(decision.get("intent") or "answer").strip()
+        if intent not in {"answer", "regenerate", "fine_tune"}:
+            intent = "answer"
+        reply = str(decision.get("reply") or "").strip() or "我已经读完当前工程上下文，可以继续帮你判断修改方式。"
+        action = "regenerate_video" if intent == "regenerate" else "fine_tune_video" if intent == "fine_tune" else None
+        payload = {
+            "intent": intent,
+            "user_message": message,
+            "edit_summary": str(decision.get("edit_summary") or "").strip(),
+            "target_files_hint": decision.get("target_files_hint") or [],
+            "risk_note": str(decision.get("risk_note") or "").strip(),
+            "base_version_id": version["id"],
+        }
+        return self._append_chat_action(project_id, reply, "proposed" if action else "chat", action, version["id"], payload)
 
     def _tool_definitions(self, allow_render_tools: bool = True) -> list[dict[str, Any]]:
         base_tools = [
@@ -781,7 +822,7 @@ class SingleAgentRunner:
         if self._render_target(job) == "local":
             return {
                 "ok": False,
-                "error": "当前项目使用用户本地渲染。请完成 HyperFrames 工程后调用 register_local_render。",
+                "error": "当前项目使用浏览器本地渲染。请完成 HyperFrames 工程后调用 register_local_render。",
             }
         hf_dir = self._resolve_read_path(job_id, project_dir)
         if not hf_dir.is_dir():
@@ -897,7 +938,7 @@ class SingleAgentRunner:
         index_path = hyperframes_dir / "index.html"
         timeline_path = vdir / "timeline.json"
         if not index_path.is_file() or not timeline_path.is_file():
-            raise RuntimeError("本地渲染工程缺少 hyperframes/index.html 或 timeline.json。")
+            raise RuntimeError("浏览器渲染工程缺少 hyperframes/index.html 或 timeline.json。")
         ensure_version_subtitles(pid, vdir)
         timeline = _safe_json(timeline_path)
         expected_duration = float(
@@ -907,7 +948,7 @@ class SingleAgentRunner:
             root_match = re.search(r'data-duration="([0-9.]+)"', index_path.read_text(encoding="utf-8"))
             expected_duration = float(root_match.group(1)) if root_match else 0
         if expected_duration <= 0:
-            raise RuntimeError("无法从本地渲染工程确定成片时长。")
+            raise RuntimeError("无法从浏览器渲染工程确定成片时长。")
         manifest = {
             "schema_version": 1,
             "project_id": pid,
@@ -958,6 +999,9 @@ class SingleAgentRunner:
                 "local_render_bundle_url": f"/api/projects/{pid}/versions/{vid}/hyperframes",
                 "render_fps": manifest["fps"],
                 "expected_duration_s": manifest["expected_duration_s"],
+                "visual_revision_round": int(
+                    (((data["jobs"][job_id].get("payload") or {}).get("patch") or {}).get("visual_revision_round") or 0)
+                ),
                 "version_dir": str(vdir),
                 "preview_path": None,
                 "created_at": store.now_iso(),
@@ -1003,47 +1047,50 @@ class SingleAgentRunner:
             timeline = _safe_json(version_dir / "timeline.json")
             transcript_path = store.project_dir(project_id) / "input" / "transcript.txt"
             source_text = transcript_path.read_text(encoding="utf-8", errors="replace") if transcript_path.is_file() else ""
-            review = run_visual_review(
-                contact_sheet,
-                {
-                    "project": project.get("name"),
-                    "input_mode": project.get("input_mode"),
-                    "requires_source_labels": project.get("input_mode") == "topic",
-                    "duration_s": expected_duration,
-                    "source_transcript": source_text,
-                    "scenes": timeline.get("scenes") or creative_plan.get("scenes") or [],
-                },
-            )
+            saved_sheet = version_dir / "agent-visual-contact-sheet.jpg"
+            shutil.copy2(contact_sheet, saved_sheet)
+            try:
+                review = run_visual_review(
+                    saved_sheet,
+                    {
+                        "project": project.get("name"),
+                        "input_mode": project.get("input_mode"),
+                        "requires_source_labels": project.get("input_mode") == "topic",
+                        "duration_s": expected_duration,
+                        "source_transcript": source_text,
+                        "scenes": timeline.get("scenes") or creative_plan.get("scenes") or [],
+                    },
+                )
+            finally:
+                saved_sheet.unlink(missing_ok=True)
             review["media_validation"] = media_validation
             review["review_is_model_generated"] = True
             (version_dir / "agent_visual_review.json").write_text(
                 json.dumps(review, ensure_ascii=False, indent=2), encoding="utf-8"
             )
             if not review.get("pass") or float(review.get("score") or 0) < 82:
-                issue_texts = []
-                for issue in review.get("issues") or []:
-                    if isinstance(issue, dict):
-                        issue_texts.append(str(issue.get("desc") or issue.get("detail") or issue.get("message") or json.dumps(issue, ensure_ascii=False)))
-                    else:
-                        issue_texts.append(str(issue))
-                raise RuntimeError(
-                    f"视觉 Agent 验收未通过：{'; '.join(issue_texts or [str(review.get('summary') or '质量不足')])}"
-                )
+                scene_numbers = self._review_scene_numbers(review, timeline, creative_plan)
+                return self._hold_failed_local_render(project_id, version_id, review, scene_numbers)
         except Exception as exc:
-            def failed_op(data):
-                if version_id in data["versions"]:
-                    data["versions"][version_id]["status"] = "local_render_failed"
-                    data["versions"][version_id]["review_error"] = str(exc)
-                if project_id in data["projects"]:
-                    data["projects"][project_id]["status"] = "local_render_failed"
-                    data["projects"][project_id]["updated_at"] = store.now_iso()
-            store.mutate(failed_op)
-            raise
+            review = {
+                "pass": False,
+                "score": 0,
+                "summary": "验收过程未完成",
+                "issues": [str(exc)],
+                "media_validation": media_validation,
+                "review_is_model_generated": False,
+            }
+            (version_dir / "agent_visual_review.json").write_text(
+                json.dumps(review, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            return self._hold_failed_local_render(project_id, version_id, review, [])
 
         def op(data):
             current = data["versions"][version_id]
             current["status"] = "local_render_ready"
             current.pop("review_error", None)
+            current["review_score"] = float(review.get("score") or 0)
+            current["review_issues"] = review.get("issues") or []
             current["preview_path"] = None
             current["preview_url"] = None
             project_data = data["projects"][project_id]
@@ -1063,6 +1110,499 @@ class SingleAgentRunner:
             return current
 
         return store.public_version(store.mutate(op))
+
+    @staticmethod
+    def _review_issue_texts(review: dict[str, Any]) -> list[str]:
+        issue_texts = []
+        for issue in review.get("issues") or []:
+            if isinstance(issue, dict):
+                issue_texts.append(
+                    str(
+                        issue.get("desc")
+                        or issue.get("detail")
+                        or issue.get("message")
+                        or json.dumps(issue, ensure_ascii=False)
+                    )
+                )
+            else:
+                issue_texts.append(str(issue))
+        return [text.strip() for text in issue_texts if text.strip()]
+
+    @staticmethod
+    def _review_scene_numbers(
+        review: dict[str, Any], timeline: dict[str, Any], creative_plan: dict[str, Any]
+    ) -> list[int]:
+        issue_blob = json.dumps(review.get("issues") or [], ensure_ascii=False)
+        scene_numbers = sorted({int(value) for value in re.findall(r"(?:场景|第)\s*(\d+)\s*(?:幕|页)?", issue_blob)})
+        if scene_numbers:
+            return scene_numbers
+        return [
+            int(scene.get("scene_number") or index + 1)
+            for index, scene in enumerate(timeline.get("scenes") or creative_plan.get("scenes") or [])
+        ]
+
+    def _hold_failed_local_render(
+        self,
+        project_id: str,
+        version_id: str,
+        review: dict[str, Any],
+        scene_numbers: list[int],
+    ) -> dict[str, Any]:
+        score = float(review.get("score") or 0)
+        issue_texts = self._review_issue_texts(review)
+        summary = str(review.get("summary") or "质量未达到验收标准")
+        reason = f"视觉 Agent 验收未通过：{'; '.join(issue_texts or [summary])}"
+        issue_lines = "\n".join(f"{index}. {text}" for index, text in enumerate(issue_texts or [summary], start=1))
+        content = (
+            f"本次成片验收得分：{score:g}/100，未达到 82 分通过线。\n\n"
+            f"发现的问题：\n{issue_lines}\n\n"
+            "成片已保留在中间页面，可以直接播放检查。是否根据这些问题重新生成？"
+        )
+
+        def op(data):
+            current = data["versions"][version_id]
+            current["status"] = "local_render_failed"
+            current["review_error"] = reason
+            current["review_score"] = score
+            current["review_issues"] = review.get("issues") or []
+            project = data["projects"][project_id]
+            project["status"] = "awaiting_retry_decision"
+            project["updated_at"] = store.now_iso()
+            data.setdefault("chat", {}).setdefault(project_id, []).append(
+                {
+                    "id": store.new_id("msg"),
+                    "project_id": project_id,
+                    "role": "agent",
+                    "content": content,
+                    "status": "awaiting_retry",
+                    "action": "retry_render",
+                    "version_id": version_id,
+                    "created_at": store.now_iso(),
+                }
+            )
+
+        store.mutate(op)
+        return {
+            "ok": False,
+            "status": "awaiting_user_retry",
+            "review": review,
+            "revision_scene_numbers": scene_numbers,
+            "version_id": version_id,
+        }
+
+    def retry_local_render(self, project_id: str, version_id: str) -> dict[str, Any]:
+        snapshot = store.snapshot()
+        version = snapshot["versions"].get(version_id)
+        if not version or version.get("project_id") != project_id:
+            raise RuntimeError("待重试的版本不存在。")
+        if version.get("status") != "local_render_failed":
+            raise RuntimeError("该版本当前没有等待重试。")
+        version_dir = Path(version["version_dir"])
+        review = _safe_json(version_dir / "agent_visual_review.json")
+        if not review:
+            review = {
+                "pass": False,
+                "score": version.get("review_score") or 0,
+                "summary": version.get("review_error") or "上一版未通过验收",
+                "issues": version.get("review_issues") or [],
+            }
+        timeline = _safe_json(version_dir / "timeline.json")
+        creative_plan = _safe_json(store.project_dir(project_id) / "analysis" / "creative_plan.json")
+        scene_numbers = self._review_scene_numbers(review, timeline, creative_plan)
+        revision_round = int(version.get("visual_revision_round") or 0) + 1
+        job = self.start(
+            project_id,
+            "apply_patch",
+            {
+                "fps": int(version.get("render_fps") or 24),
+                "render_target": "local",
+                "patch": {
+                    "regenerate_scene_code": True,
+                    "visual_review": review,
+                    "revision_scene_numbers": scene_numbers,
+                    "rejected_version_id": version_id,
+                    "visual_revision_round": revision_round,
+                },
+            },
+        )
+
+        def op(data):
+            for message in data.setdefault("chat", {}).setdefault(project_id, []):
+                if message.get("action") == "retry_render" and message.get("version_id") == version_id:
+                    message["action"] = None
+                    message["status"] = "retrying"
+            data["chat"][project_id].append(
+                {
+                    "id": store.new_id("msg"),
+                    "project_id": project_id,
+                    "role": "agent",
+                    "content": "已开始重试。上一版的验收分数和问题已完整反馈给提示词 AI，正在重新设计相关页面。",
+                    "status": "running",
+                    "job_id": job["id"],
+                    "created_at": store.now_iso(),
+                }
+            )
+
+        store.mutate(op)
+        return job
+
+    def regenerate_from_chat(self, project_id: str, version_id: str, message_id: str | None = None) -> dict[str, Any]:
+        action_payload = self._find_chat_action_payload(project_id, version_id, message_id, "regenerate_video")
+        version = store.snapshot()["versions"].get(version_id)
+        if not version or version.get("project_id") != project_id:
+            raise RuntimeError("待重新生成的版本不存在。")
+        revision_round = int(version.get("visual_revision_round") or 0) + 1
+        job = self.start(
+            project_id,
+            "apply_patch",
+            {
+                "fps": int(version.get("render_fps") or 24),
+                "render_target": "local",
+                "patch": {
+                    "chat_revision_request": action_payload,
+                    "regenerate_all": True,
+                    "base_version_id": version_id,
+                    "visual_revision_round": revision_round,
+                },
+            },
+        )
+        self._consume_chat_action(project_id, version_id, message_id, "regenerate_video")
+        self._append_action_started(
+            project_id,
+            job["id"],
+            "已开始重新生成。对话 AI 已把你的要求整理给提示词 AI，接下来会重新规划全片并生成新的 HyperFrames 工程。",
+        )
+        return job
+
+    def fine_tune_from_chat(self, project_id: str, version_id: str, message_id: str | None = None) -> dict[str, Any]:
+        action_payload = self._find_chat_action_payload(project_id, version_id, message_id, "fine_tune_video")
+        version = store.snapshot()["versions"].get(version_id)
+        if not version or version.get("project_id") != project_id:
+            raise RuntimeError("待微调的版本不存在。")
+        job = self.start(
+            project_id,
+            "fine_tune",
+            {
+                "fps": int(version.get("render_fps") or 24),
+                "base_version_id": version_id,
+                "chat_revision_request": action_payload,
+            },
+        )
+        self._consume_chat_action(project_id, version_id, message_id, "fine_tune_video")
+        self._append_action_started(
+            project_id,
+            job["id"],
+            "已开始微调。对话 AI 会读取当前工程代码，只改必要文件，然后重新交给当前浏览器渲染和验收。",
+        )
+        return job
+
+    def retry_unplayable_render(
+        self,
+        project_id: str,
+        version_id: str,
+        error_message: str,
+        attempt: int,
+        media_validation: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if attempt < 1 or attempt > 3:
+            raise RuntimeError("不可播放自动重试次数必须在 1 到 3 之间。")
+        snapshot = store.snapshot()
+        version = snapshot["versions"].get(version_id)
+        if not version or version.get("project_id") != project_id:
+            raise RuntimeError("待修复的版本不存在。")
+        if version.get("status") not in {"awaiting_local_render", "local_render_failed", "local_render_ready"}:
+            raise RuntimeError("该版本当前不适合做不可播放自动修复。")
+        review = {
+            "pass": False,
+            "score": 0,
+            "summary": "本机没有生成可播放视频",
+            "issues": [error_message],
+            "media_validation": media_validation or {},
+            "review_is_model_generated": False,
+            "auto_retry_attempt": attempt,
+        }
+        revision_round = int(version.get("visual_revision_round") or 0) + 1
+        job = self.start(
+            project_id,
+            "apply_patch",
+            {
+                "fps": int(version.get("render_fps") or 24),
+                "render_target": "local",
+                "patch": {
+                    "regenerate_scene_code": True,
+                    "visual_review": review,
+                    "revision_scene_numbers": [],
+                    "rejected_version_id": version_id,
+                    "visual_revision_round": revision_round,
+                    "unplayable_auto_retry_attempt": attempt,
+                },
+            },
+        )
+
+        def op(data):
+            current = data["versions"].get(version_id)
+            if current:
+                current["status"] = "local_render_failed"
+                current["review_error"] = "本机没有生成可播放视频：" + error_message
+                current["review_score"] = 0
+                current["review_issues"] = [error_message]
+                current["unplayable_retry_attempt"] = attempt
+            data.setdefault("chat", {}).setdefault(project_id, []).append(
+                {
+                    "id": store.new_id("msg"),
+                    "project_id": project_id,
+                    "role": "agent",
+                    "content": f"本机没有生成可播放视频，已自动启动第 {attempt}/3 次工程修复。原因：{error_message}",
+                    "status": "running",
+                    "job_id": job["id"],
+                    "created_at": store.now_iso(),
+                }
+            )
+
+        store.mutate(op)
+        return job
+
+    def _append_chat_action(
+        self,
+        project_id: str,
+        content: str,
+        status: str,
+        action: str | None,
+        version_id: str | None,
+        action_payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        message = {
+            "id": store.new_id("msg"),
+            "project_id": project_id,
+            "role": "agent",
+            "content": content,
+            "status": status,
+            "action": action,
+            "version_id": version_id,
+            "action_payload": action_payload,
+            "created_at": store.now_iso(),
+        }
+
+        def op(data):
+            data.setdefault("chat", {}).setdefault(project_id, []).append(message)
+            return message
+
+        return store.public_chat_message(store.mutate(op))
+
+    def _consume_chat_action(
+        self,
+        project_id: str,
+        version_id: str,
+        message_id: str | None,
+        expected_action: str,
+    ) -> dict[str, Any]:
+        def op(data):
+            messages = data.setdefault("chat", {}).setdefault(project_id, [])
+            candidates = [
+                message for message in messages
+                if message.get("action") == expected_action and message.get("version_id") == version_id
+            ]
+            if message_id:
+                candidates = [message for message in candidates if message.get("id") == message_id]
+            if not candidates:
+                raise RuntimeError("没有找到等待确认的对话动作。")
+            message = candidates[-1]
+            message["action"] = None
+            message["status"] = "action_accepted"
+            return dict(message.get("action_payload") or {})
+
+        return store.mutate(op)
+
+    def _find_chat_action_payload(
+        self,
+        project_id: str,
+        version_id: str,
+        message_id: str | None,
+        expected_action: str,
+    ) -> dict[str, Any]:
+        messages = store.snapshot().setdefault("chat", {}).setdefault(project_id, [])
+        candidates = [
+            message for message in messages
+            if message.get("action") == expected_action and message.get("version_id") == version_id
+        ]
+        if message_id:
+            candidates = [message for message in candidates if message.get("id") == message_id]
+        if not candidates:
+            raise RuntimeError("没有找到等待确认的对话动作。")
+        return dict((candidates[-1]).get("action_payload") or {})
+
+    def _append_action_started(self, project_id: str, job_id: str, content: str) -> None:
+        def op(data):
+            data.setdefault("chat", {}).setdefault(project_id, []).append(
+                {
+                    "id": store.new_id("msg"),
+                    "project_id": project_id,
+                    "role": "agent",
+                    "content": content,
+                    "status": "running",
+                    "job_id": job_id,
+                    "created_at": store.now_iso(),
+                }
+            )
+
+        store.mutate(op)
+
+    def _latest_interactive_version(
+        self, project_id: str, snapshot: dict[str, Any] | None = None
+    ) -> dict[str, Any] | None:
+        data = snapshot or store.snapshot()
+        versions = [
+            version
+            for version in data.get("versions", {}).values()
+            if version.get("project_id") == project_id
+            and version.get("status") in {"local_render_ready", "local_render_failed", "completed"}
+        ]
+        versions.sort(key=lambda version: (int(version.get("version_number") or 0), version.get("created_at") or ""))
+        return versions[-1] if versions else None
+
+    def _dialogue_context(
+        self,
+        project_id: str,
+        project: dict[str, Any],
+        version: dict[str, Any],
+        snapshot: dict[str, Any],
+    ) -> dict[str, Any]:
+        version_dir = Path(str(version.get("version_dir") or ""))
+        hyperframes_dir = version_dir / "hyperframes"
+        timeline = _safe_json(version_dir / "timeline.json")
+        review = _safe_json(version_dir / "agent_visual_review.json")
+        file_summaries = []
+        for path in sorted(hyperframes_dir.rglob("*")):
+            if not path.is_file() or path.suffix.lower() not in {".html", ".css", ".js", ".json", ".svg"}:
+                continue
+            relative = path.relative_to(version_dir).as_posix()
+            text = path.read_text(encoding="utf-8", errors="replace")
+            file_summaries.append({"path": relative, "chars": len(text), "preview": _trim(text, 6000)})
+            if len(file_summaries) >= 10:
+                break
+        return {
+            "app_requirements": {
+                "product": "一键科普视频生成",
+                "render_policy": "服务器保存 HyperFrames 工程，用户浏览器本地真实渲染 MP4。",
+                "subtitles": "简体中文字幕固定居中放在底部安全区，淡入淡出。",
+                "quality_gate": "可播放视频之外的验收问题先展示分数和问题，由用户决定是否重新生成或微调。",
+            },
+            "project": store.public_project(project),
+            "latest_version": store.public_version(version),
+            "timeline": timeline,
+            "visual_review": review,
+            "recent_chat": [store.public_chat_message(c) for c in snapshot.get("chat", {}).get(project_id, [])][-12:],
+            "hyperframes_files": file_summaries,
+        }
+
+    def _run_dialogue_fine_tune(self, job_id: str, prepared: PreparedSource) -> None:
+        started = time.perf_counter()
+        snapshot = store.snapshot()
+        job = snapshot["jobs"][job_id]
+        project_id = job["project_id"]
+        project = snapshot["projects"].get(project_id) or {}
+        payload = job.get("payload") or {}
+        base_version_id = str(payload.get("base_version_id") or "")
+        base_version = snapshot["versions"].get(base_version_id)
+        if not base_version or base_version.get("project_id") != project_id:
+            raise RuntimeError("微调缺少可读取的基准版本。")
+        base_dir = Path(str(base_version.get("version_dir") or ""))
+        base_hf = base_dir / "hyperframes"
+        if not (base_hf / "index.html").is_file():
+            raise RuntimeError("基准版本缺少 HyperFrames 工程，无法微调。")
+
+        self._set_step(job_id, 18, "对话 AI 正在读取当前 HyperFrames 工程")
+        version_count = len([v for v in snapshot["versions"].values() if v["project_id"] == project_id])
+        version_hint = f"v{version_count + 1:03d}"
+        created = self._tool_create_version_dir(job_id, version_hint)
+        version_dir = Path(str(created["version_dir"]))
+        shutil.copytree(base_hf, version_dir / "hyperframes", dirs_exist_ok=True)
+        for name in ("timeline.json", "subtitles.srt", "SOURCE_LEDGER.md", "local_render_manifest.json"):
+            src = base_dir / name
+            if src.is_file():
+                shutil.copy2(src, version_dir / name)
+
+        context = self._dialogue_context(project_id, project, {**base_version, "version_dir": str(version_dir)}, snapshot)
+        context["action_request"] = payload.get("chat_revision_request") or {}
+        context["output_contract"] = {
+            "base_dir": str(version_dir),
+            "allowed_paths": "只能修改 hyperframes/ 下的 html、css、js、json、svg 文件；如确实必要可修改 timeline.json。",
+            "return_json": {
+                "reply": "给用户看的说明",
+                "changed_files": [{"path": "hyperframes/index.html", "content": "完整新文件内容"}],
+                "timeline": "可选，完整 timeline.json 对象",
+            },
+        }
+        self._set_step(job_id, 32, "对话 AI 正在制定局部微调代码补丁")
+        response = create_client().chat.completions.create(
+            model=deepseek_settings()["text_model"],
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        (PROMPTS_DIR / "dialogue_ai_system.md").read_text(encoding="utf-8")
+                        + "\n\n现在你处于微调执行阶段。请直接返回需要写入的完整工程文件内容。"
+                        "只改满足用户要求的最少文件；保持音频、字幕时间轴、来源左下角和可渲染契约不变。"
+                        "输出 JSON：reply, changed_files, timeline。"
+                    ),
+                },
+                {"role": "user", "content": json.dumps(context, ensure_ascii=False)},
+            ],
+            temperature=0.18,
+            max_tokens=14000,
+            extra_body={"thinking": {"type": "disabled"}},
+        )
+        result = parse_json_object(response.choices[0].message.content)
+        changed_files = result.get("changed_files") or []
+        if not isinstance(changed_files, list) or not changed_files:
+            raise RuntimeError("对话 AI 没有返回可应用的工程文件修改。")
+
+        self._set_step(job_id, 58, "正在应用对话 AI 的工程文件修改")
+        applied: list[str] = []
+        for item in changed_files[:12]:
+            if not isinstance(item, dict):
+                continue
+            relative = str(item.get("path") or "").strip().replace("\\", "/")
+            content = item.get("content")
+            if not relative or not isinstance(content, str):
+                continue
+            if relative.startswith("/") or ".." in Path(relative).parts:
+                raise RuntimeError(f"微调返回了越界路径：{relative}")
+            if not (
+                relative.startswith("hyperframes/")
+                and Path(relative).suffix.lower() in {".html", ".css", ".js", ".json", ".svg"}
+            ):
+                raise RuntimeError(f"微调只能修改 HyperFrames 文本工程文件：{relative}")
+            target = (version_dir / relative).resolve()
+            if not _is_under(target, version_dir / "hyperframes"):
+                raise RuntimeError(f"微调写入路径越界：{relative}")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding="utf-8")
+            applied.append(relative)
+        if not applied:
+            raise RuntimeError("对话 AI 返回的修改没有可应用文件。")
+        if isinstance(result.get("timeline"), dict):
+            (version_dir / "timeline.json").write_text(
+                json.dumps(result["timeline"], ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+
+        self._set_step(job_id, 82, "微调工程已完成，等待当前浏览器重新渲染")
+        registered = self._tool_register_local_render(
+            job_id,
+            str(version_dir),
+            int(payload.get("fps") or base_version.get("render_fps") or 24),
+        )
+        if not registered.get("ok"):
+            raise RuntimeError("微调版本注册失败。")
+        self._tool_write_chat(
+            job_id,
+            (
+                f"微调工程已完成，修改了 {len(applied)} 个文件：{', '.join(applied[:5])}。"
+                f"耗时 {time.perf_counter() - started:.1f} 秒，接下来由当前浏览器生成 MP4 并验收。"
+            ),
+            "awaiting_local_render",
+        )
 
     def _tool_write_chat(self, job_id: str, content: str, status: str) -> dict[str, Any]:
         pid = store.snapshot()["jobs"][job_id]["project_id"]
@@ -1089,7 +1629,7 @@ class SingleAgentRunner:
         job = snapshot["jobs"][job_id]
         project_id = job["project_id"]
         project = snapshot["projects"].get(project_id) or {}
-        self._append_log(job_id, "openJiuwen 多 Agent 团队开始生成 HyperFrames 工程：总导演统一风格，逐幕 Agent 分别设计科学动画。", chat=True)
+        self._append_log(job_id, "提示词 AI 正在设计分镜，动画 AI 将逐页生成 HyperFrames 工程。", chat=True)
         self._set_step(job_id, 24, "正在创建版本目录与渲染工程")
 
         version_count = len([v for v in snapshot["versions"].values() if v["project_id"] == project_id])
@@ -1111,36 +1651,46 @@ class SingleAgentRunner:
         if not boot.get("ok"):
             raise RuntimeError(str(boot.get("error") or "HyperFrames 工程初始化失败。"))
 
-        creative_path = store.project_dir(project_id) / "analysis" / "creative_plan.json"
-        trace_path = store.project_dir(project_id) / "analysis" / "agent_trace.json"
-        if creative_path.is_file():
-            creative_plan = _safe_json(creative_path)
-        else:
-            self._set_step(job_id, 32, "总导演与逐幕 Agent 正在并行设计")
-            team_result = run_creative_team(project_id, self._team_payload(project, prepared))
-            creative_plan = team_result["creative_plan"]
-            creative_path.parent.mkdir(parents=True, exist_ok=True)
-            creative_path.write_text(json.dumps(creative_plan, ensure_ascii=False, indent=2), encoding="utf-8")
-            trace_path.write_text(json.dumps(team_result, ensure_ascii=False, indent=2), encoding="utf-8")
-            self._append_log(
-                job_id,
-                f"艺术圣经已经确定，{len(team_result.get('scene_agents') or [])} 位逐幕 Agent 已完成独立设计，整合 Agent 正在统一节奏。",
-                chat=True,
-            )
-
-        self._set_step(job_id, 48, "整合 Agent 正在生成字幕、连续动画与画面布局")
-        summary = materialize_science_video_version(
+        self._set_step(job_id, 32, "提示词 AI 正在编写逐页动画设计")
+        patch = (job.get("payload") or {}).get("patch") or {}
+        revision_feedback = None
+        if patch.get("visual_review"):
+            revision_feedback = {
+                "rejected_version_id": patch.get("rejected_version_id"),
+                "review_score": (patch.get("visual_review") or {}).get("score"),
+                "review_summary": (patch.get("visual_review") or {}).get("summary"),
+                "issues": (patch.get("visual_review") or {}).get("issues") or [],
+                "revision_scene_numbers": patch.get("revision_scene_numbers") or [],
+                "instruction": "根据验收问题重新设计对应页面，并保证修复后与全片视觉体系一致。",
+            }
+            if patch.get("unplayable_auto_retry_attempt"):
+                revision_feedback["instruction"] = (
+                    "上一版工程未能在浏览器生成可播放视频。请优先修复 HyperFrames 结构、素材引用、"
+                    "时间线、尺寸、动画脚本和字幕挂载问题，保证新工程能稳定启动和编码。"
+                )
+                revision_feedback["unplayable_auto_retry_attempt"] = patch.get("unplayable_auto_retry_attempt")
+        if patch.get("chat_revision_request"):
+            chat_request = patch.get("chat_revision_request") or {}
+            revision_feedback = {
+                **(revision_feedback or {}),
+                "rejected_version_id": patch.get("base_version_id") or patch.get("rejected_version_id"),
+                "revision_mode": "full_regeneration" if patch.get("regenerate_all") else "revision",
+                "user_message": chat_request.get("user_message"),
+                "dialogue_ai_summary": chat_request.get("edit_summary"),
+                "target_files_hint": chat_request.get("target_files_hint") or [],
+                "instruction": (
+                    "这是用户在初版生成后确认的重新生成需求。请把它作为全片重新规划的核心目标，"
+                    "重新设计页面结构、视觉隐喻和动画节奏，同时保持原始讲稿/旁白时间轴不被改写。"
+                ),
+            }
+        summary = materialize_two_stage_version(
             project=project,
             prepared=prepared,
             version_dir=version_dir,
             hyperframes_dir=Path(str(boot["project_dir"])),
             audio_asset_name=audio_name,
-            creative_plan=creative_plan,
-        )
-
-        version_dir.joinpath("agent_trace.json").write_text(
-            trace_path.read_text(encoding="utf-8") if trace_path.is_file() else "{}",
-            encoding="utf-8",
+            progress=lambda progress, step: self._set_step(job_id, progress, step),
+            revision_feedback=revision_feedback,
         )
         source_ledger = prepared.source_dir / "SOURCE_LEDGER.md"
         if source_ledger.is_file():
@@ -1155,9 +1705,9 @@ class SingleAgentRunner:
             self._tool_write_chat(
                 job_id,
                 (
-                    f"视频设计与 HyperFrames 工程已完成：{summary['scene_count']} 个场景、"
+                    f"视频设计与 HyperFrames 工程已完成：{summary['scene_code_count']} 幕 Agent 原创源码、"
                     f"{summary['caption_count']} 条字幕，总时长约 {summary['duration_s']} 秒。"
-                    "网页正在连接用户电脑上的本地 Renderer，服务器不会执行视频渲染。"
+                    "网页正在下载工程并调用浏览器内置渲染器，服务器不会执行或保存视频成片。"
                 ),
                 "awaiting_local_render",
             )
@@ -1189,7 +1739,7 @@ class SingleAgentRunner:
                     "requires_source_labels": project.get("input_mode") == "topic",
                 "duration_s": summary["duration_s"],
                 "source_transcript": prepared.source_text,
-                "scenes": creative_plan.get("scenes") or [],
+                "scenes": summary["plan"].get("pages") or [],
             },
         )
         review["media_validation"] = media
@@ -1218,28 +1768,23 @@ class SingleAgentRunner:
         snapshot = store.snapshot()
         job = snapshot["jobs"][job_id]
         project = snapshot["projects"].get(job["project_id"]) or {}
-        self._append_log(job_id, "openJiuwen 多 Agent 团队开始分析：内容、视觉、时序专家并行，总导演和逐幕 Agent 接力设计。", chat=True)
-        self._set_step(job_id, 30, "总导演与逐幕 Agent 正在并行分析")
-        summary = build_science_video_analysis(project, prepared)
-        team_result = run_creative_team(str(project.get("id")), self._team_payload(project, prepared))
+        self._append_log(job_id, "提示词 AI 正在根据旁白生成逐页动画设计。", chat=True)
+        self._set_step(job_id, 30, "提示词 AI 正在分析讲稿与页面结构")
+        summary = build_two_stage_analysis(project, prepared)
         analysis_dir = store.project_dir(str(project.get("id"))) / "analysis"
         analysis_dir.mkdir(parents=True, exist_ok=True)
         (analysis_dir / "creative_plan.json").write_text(
-            json.dumps(team_result["creative_plan"], ensure_ascii=False, indent=2), encoding="utf-8"
+            json.dumps(summary["plan"], ensure_ascii=False, indent=2), encoding="utf-8"
         )
         (analysis_dir / "agent_trace.json").write_text(
-            json.dumps(team_result, ensure_ascii=False, indent=2), encoding="utf-8"
+            json.dumps({"pipeline":"two_stage_prompt_to_animation","prompt_ai":summary["trace"]}, ensure_ascii=False, indent=2), encoding="utf-8"
         )
         self._append_log(
             job_id,
-            f"艺术圣经与 {len(team_result.get('scene_agents') or [])} 幕独立动画设计已完成。",
+            f"提示词 AI 已完成 {summary['scene_count']} 页独立动画设计。",
             chat=True,
         )
-        summary["analysis"]["multi_agent"] = {
-            "framework": "openjiuwen",
-            "elapsed_ms": team_result["elapsed_ms"],
-            "topology": team_result["topology"],
-        }
+        summary["analysis"]["generation_pipeline"] = "two_stage_prompt_to_animation"
         analysis_result = self._tool_write_analysis(job_id, summary["analysis"])
         plan_result = self._tool_write_edit_plan(job_id, summary["edit_plan"])
         if not analysis_result.get("ok") or not plan_result.get("ok"):
@@ -1382,7 +1927,7 @@ class SingleAgentRunner:
 4. 画面要像高级科学动态图解：每个关键元素都有出场、退场和语义自运动；优先用机制、尺度、对比、时间线、系统关系解释旁白，不做静态幻灯片或纯文字堆叠。
 5. 卡片、信息块、浮层尽量用圆角和半透明表面，避免生硬纯色底板；布局要有主次、留白和节奏。
 6. 如果任务受阻，必须如实说明，并用 write_chat 告诉用户当前问题；需要用户补充信息时，用 report_progress(status=\"needs_input\") + write_chat。不要假装已经生成。
-7. 必须读取项目的 `docs/SCIENCE_VIDEO_WORKFLOW.md`，也可以读取 HyperFrames 仓库作为实现参考；当前项目最终要由你自己在项目目录里完成。
+7. 必须读取项目的 `docs/MULTI_AGENT_ANIMATION_REQUIREMENTS.md` 和 `docs/SCIENCE_VIDEO_WORKFLOW.md`；前者是不可退让的最高约束，也可以读取 HyperFrames 仓库作为实现参考。
 8. 不要直接运行 `hyperframes init`。创建版本目录后，优先调用 `bootstrap_hyperframes_project` 离线生成 `hyperframes/` 子工程，再在其中写 HTML 和真实渲染。
 
 工作边界：
@@ -1462,7 +2007,7 @@ class SingleAgentRunner:
                 self._fail(job_id, "分析任务没有生成 analysis.json 和 edit_plan.json。")
                 return False
             return True
-        if job["type"] in {"generate", "apply_patch"}:
+        if job["type"] in {"generate", "apply_patch", "fine_tune"}:
             local_result = job.get("result") or {}
             if local_result.get("render_target") == "local":
                 version = snapshot["versions"].get(str(local_result.get("version_id") or ""))
@@ -1554,7 +2099,7 @@ class SingleAgentRunner:
                 job["status"] = "completed"
             job["progress"] = max(float(job.get("progress") or 0), 100.0)
             local_pending = (job.get("result") or {}).get("render_target") == "local"
-            job["current_step"] = "等待用户电脑本地渲染" if local_pending else "完成"
+            job["current_step"] = "等待当前浏览器本地渲染" if local_pending else "完成"
             job["completed_at"] = store.now_iso()
             project = data["projects"].get(job["project_id"])
             if project and job["status"] != "needs_input":
@@ -1610,6 +2155,17 @@ class SingleAgentRunner:
             job["error_message"] = message
             job["completed_at"] = store.now_iso()
             job["updated_at"] = store.now_iso()
+            data.setdefault("chat", {}).setdefault(job["project_id"], []).append(
+                {
+                    "id": store.new_id("msg"),
+                    "project_id": job["project_id"],
+                    "job_id": job_id,
+                    "role": "agent",
+                    "content": f"当前版本尚未达到交付标准，Agent 已停止登记成片。具体原因：{message}",
+                    "status": "failed",
+                    "created_at": store.now_iso(),
+                }
+            )
             project = data["projects"].get(job["project_id"])
             if project:
                 project["status"] = "failed"

@@ -23,6 +23,8 @@ export interface ChatMessage {
   text: string;
   timestamp: number;
   patch?: Record<string, unknown>;
+  action?: string | null;
+  versionId?: string;
 }
 
 interface ProjectState {
@@ -32,11 +34,8 @@ interface ProjectState {
   assets: Asset[];
   filter: AssetType;
   chatMessages: ChatMessage[];
-  showSettingsDrawer: boolean;
   showAssetDrawer: boolean;
   selectedAssetId: string | null;
-  modelProvider: string;
-  apiKey: string;
   videoRatio: string;
   videoResolution: string;
   frameRate: number;
@@ -79,11 +78,8 @@ interface ProjectState {
   removeAsset: (id: string) => void;
   setChatMessages: (msgs: ChatMessage[]) => void;
   addChatMessage: (msg: ChatMessage) => void;
-  setShowSettingsDrawer: (v: boolean) => void;
   setShowAssetDrawer: (v: boolean) => void;
   setSelectedAssetId: (id: string | null) => void;
-  setModelProvider: (v: string) => void;
-  setApiKey: (v: string) => void;
   setVideoRatio: (v: string) => void;
   setVideoResolution: (v: string) => void;
   setFrameRate: (v: number) => void;
@@ -116,7 +112,6 @@ interface ProjectState {
   setError: (e: string | null) => void;
   setChatBusy: (v: boolean) => void;
   setActiveJobId: (id: string | null) => void;
-  clearProject: () => void;
 }
 
 export const useProjectStore = create<ProjectState>((set) => ({
@@ -126,11 +121,8 @@ export const useProjectStore = create<ProjectState>((set) => ({
   assets: [],
   filter: 'all',
   chatMessages: [],
-  showSettingsDrawer: false,
   showAssetDrawer: false,
   selectedAssetId: null,
-  modelProvider: 'deepseek',
-  apiKey: '',
   videoRatio: '9:16',
   videoResolution: '1080p正式导出',
   frameRate: 24,
@@ -173,11 +165,8 @@ export const useProjectStore = create<ProjectState>((set) => ({
   removeAsset: (id) => set((s) => ({ assets: s.assets.filter((a) => a.id !== id) })),
   setChatMessages: (msgs) => set({ chatMessages: msgs }),
   addChatMessage: (msg) => set((s) => ({ chatMessages: [...s.chatMessages, msg] })),
-  setShowSettingsDrawer: (v) => set({ showSettingsDrawer: v }),
   setShowAssetDrawer: (v) => set({ showAssetDrawer: v }),
   setSelectedAssetId: (id) => set({ selectedAssetId: id }),
-  setModelProvider: (v) => set({ modelProvider: v }),
-  setApiKey: (v) => set({ apiKey: v }),
   setVideoRatio: (v) => set({ videoRatio: v }),
   setVideoResolution: (v) => set({ videoResolution: v }),
   setFrameRate: (v) => set({ frameRate: v }),
@@ -210,33 +199,4 @@ export const useProjectStore = create<ProjectState>((set) => ({
   setError: (e) => set({ error: e }),
   setChatBusy: (v) => set({ chatBusy: v }),
   setActiveJobId: (id) => set({ activeJobId: id }),
-  clearProject: () =>
-    set({
-      projectId: null,
-      assets: [],
-      step: 'upload',
-      demoMode: false,
-      chatMessages: [],
-      generateHyperFramesProgress: 0,
-      generateDraftProgress: 0,
-      editPlan: null,
-      versions: [],
-      currentVersionId: null,
-      previewUrl: null,
-      pendingPatch: null,
-      error: null,
-      chatBusy: false,
-      activeJobId: null,
-      overallProgress: 0,
-      analyzeCompletedSteps: [],
-      analyzeLogs: [],
-      jobWarnings: [],
-      planProgress: 0,
-      planSubstep: null,
-      taskText: '准备就绪',
-      scriptText: '',
-      inputMode: 'topic',
-      topic: '',
-      requirements: '',
-    }),
 }));

@@ -3,9 +3,12 @@ import React from 'react';
 interface ChatMessageBubbleProps {
   role: 'user' | 'agent';
   text: string;
+  actionLabel?: string;
+  onAction?: () => void;
+  actionDisabled?: boolean;
 }
 
-export default function ChatMessageBubble({ role, text }: ChatMessageBubbleProps) {
+export default function ChatMessageBubble({ role, text, actionLabel, onAction, actionDisabled }: ChatMessageBubbleProps) {
   const isUser = role === 'user';
 
   return (
@@ -22,7 +25,17 @@ export default function ChatMessageBubble({ role, text }: ChatMessageBubbleProps
             : 'glass rounded-tl-sm text-text-secondary'
         }`}
       >
-        {text}
+        <div>{text}</div>
+        {actionLabel && onAction && (
+          <button
+            type="button"
+            onClick={onAction}
+            disabled={actionDisabled}
+            className="mt-3 w-full rounded-xl border border-primary/35 bg-primary/15 px-3 py-2 text-sm font-semibold text-primary-light transition-colors hover:bg-primary/25 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {actionLabel}
+          </button>
+        )}
       </div>
       {isUser && (
         <div className="w-7 h-7 rounded-full bg-secondary/20 flex items-center justify-center flex-shrink-0 ml-2 mt-0.5">

@@ -12,6 +12,13 @@ import { checkLocalRenderer, renderLocally } from '../api/localRenderer';
 
 const TERMINAL_JOB_STATUSES = ['completed', 'failed', 'cancelled', 'needs_input'];
 
+function newClientId() {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+  return `local_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+}
+
 function mapChatMessage(m: BackendChatMessage) {
   return {
     id: m.id,
@@ -19,7 +26,14 @@ function mapChatMessage(m: BackendChatMessage) {
     text: m.content,
     timestamp: Date.parse(m.created_at) || Date.now(),
     patch: m.patch,
+    action: m.action,
+    versionId: m.version_id,
   };
+}
+
+function isBrowserEnvironmentError(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error || '');
+  return /HTTPS|Chrome|Edge|浏览器不支持|当前设备无法|安全连接|编码/.test(message);
 }
 
 export function useStudioWorkflow() {
@@ -86,13 +100,22 @@ export function useStudioWorkflow() {
     await refreshAssets(projectId);
     const versions = await api.listVersions(projectId);
     store.setVersions(versions);
-    if (versions.length && p.current_version_id) {
-      const cur = versions.find((v) => v.id === p.current_version_id) || versions[0];
+    const pendingVersion = versions.find((version) =>
+      ['awaiting_local_render', 'local_render_failed', 'local_render_ready'].includes(version.status || '')
+    );
+    if (versions.length && (p.current_version_id || pendingVersion)) {
+      const cur = versions.find((v) => v.id === p.current_version_id) || pendingVersion || versions[0];
       store.setCurrentVersionId(cur.id);
       store.setVersion(`v${cur.version_number}.0`);
       store.setPreviewUrl(null);
       store.setStep('result');
-      store.setTaskText('生成完成');
+      store.setTaskText(
+        cur.status === 'local_render_failed'
+          ? '上一版验收未通过，等待你决定是否重试'
+          : pendingVersion
+            ? '工程已就绪，可在当前浏览器生成 MP4'
+            : '生成完成',
+      );
     } else {
       store.setCurrentVersionId(null);
       store.setPreviewUrl(null);
@@ -254,7 +277,11 @@ export function useStudioWorkflow() {
   }, [loadProject, refreshAssets, refreshChat, refreshVersions, store, watchJob]);
 
   const startAnalyze = useCallback(async () => {
-    const projectId = await ensureProject();
+    store.setError(null);
+    if (!store.projectId) {
+      store.setError('当前工作台没有绑定项目，请返回新建项目后再试');
+      return;
+    }
     if (store.inputMode === 'topic' && !store.topic.trim()) {
       store.setError('请先填写科普主题');
       return;
@@ -267,64 +294,187 @@ export function useStudioWorkflow() {
       store.setError('请先上传一条视频或音频');
       return;
     }
-    if (store.inputMode === 'script' && store.scriptText.trim()) {
-      await api.putScript(projectId, store.scriptText);
+    try {
+      const projectId = store.projectId;
+      if (store.inputMode === 'script' && store.scriptText.trim()) {
+        await api.putScript(projectId, store.scriptText);
+      }
+      store.setTaskText('正在启动 Agent 分析');
+      store.setStep('analyze');
+      store.setOverallProgress(1);
+      store.setAnalyzeCompletedSteps([]);
+      store.setAnalyzeLogs([]);
+      store.setJobWarnings([]);
+      store.setPlanProgress(0);
+      store.setPlanSubstep(null);
+      const job = await api.analyze(projectId);
+      watchJob(
+        job.id,
+        async () => {
+          const plan = await api.getEditPlan(projectId);
+          store.setEditPlan(plan);
+          store.setStep('plan');
+          store.setTaskText('分析完成，请确认视频方案');
+          await refreshAssets(projectId);
+        },
+        async (terminalJob) => {
+          if (terminalJob.status === 'needs_input' || terminalJob.status === 'failed') {
+            await refreshChat(projectId);
+          }
+        },
+      );
+    } catch (error) {
+      store.setStep('upload');
+      store.setTaskText('Agent 分析未启动');
+      store.setError(error instanceof Error ? error.message : '启动科普方案失败，请稍后重试');
     }
-    store.setStep('analyze');
-    store.setOverallProgress(0);
-    store.setAnalyzeCompletedSteps([]);
-    store.setAnalyzeLogs([]);
-    store.setJobWarnings([]);
-    store.setPlanProgress(0);
-    store.setPlanSubstep(null);
-    const job = await api.analyze(projectId);
-    watchJob(
-      job.id,
-      async () => {
-        const plan = await api.getEditPlan(projectId);
-        store.setEditPlan(plan);
-        store.setStep('plan');
-        store.setTaskText('分析完成，请确认剪辑方案');
-        await refreshAssets(projectId);
-      },
-      async (terminalJob) => {
-        if (terminalJob.status === 'needs_input' || terminalJob.status === 'failed') {
-          await refreshChat(projectId);
-        }
-      },
-    );
-  }, [ensureProject, refreshAssets, refreshChat, store, watchJob]);
+  }, [refreshAssets, refreshChat, store, watchJob]);
 
   const persistAsset = useCallback(async (assetId: string, body: Record<string, unknown>) => {
     await api.updateAsset(assetId, body);
     if (store.projectId) await refreshAssets(store.projectId);
   }, [refreshAssets, store]);
 
-  const finishLocalRender = useCallback(async (
+  const finishLocalRender = useCallback(async function completeLocalRender(
     projectId: string,
     versionId: string,
     bundleUrl: string,
     fps: number,
-  ) => {
-    store.setTaskText('正在连接用户电脑上的本地 Renderer');
-    store.setGenerateHyperFramesProgress(86);
-    const bundle = await api.downloadLocalRenderBundle(bundleUrl);
-    const localResult = await renderLocally(bundle, fps, (progress, step) => {
-      store.setTaskText(step);
-      store.setGenerateHyperFramesProgress(Math.min(98, 86 + Math.round(progress * 0.12)));
-    });
-    store.setTaskText('正在上传临时联系表并进行视觉验收');
-    store.setGenerateHyperFramesProgress(99);
-    await api.reviewLocalRender(
-      projectId,
-      versionId,
-      localResult.contactSheet,
-      localResult.mediaValidation,
-    );
-    store.setGenerateHyperFramesProgress(100);
-    await refreshVersions(projectId, '本地渲染与视觉验收完成，MP4 仅保留在当前电脑');
-    store.setPreviewUrl(URL.createObjectURL(localResult.video));
-  }, [refreshVersions, store]);
+    autoRepairAttempt = 0,
+  ) {
+    try {
+      store.setTaskText('正在浏览器内准备 HyperFrames 工程');
+      store.setGenerateHyperFramesProgress(86);
+      const bundle = await api.downloadLocalRenderBundle(bundleUrl);
+      const localResult = await renderLocally(bundle, fps, (progress, step) => {
+        store.setTaskText(step);
+        store.setGenerateHyperFramesProgress(Math.min(98, 86 + Math.round(progress * 0.12)));
+      });
+      store.setTaskText('正在提交逐幕联系表进行视觉验收');
+      store.setGenerateHyperFramesProgress(99);
+      const review = await api.reviewLocalRender(
+        projectId,
+        versionId,
+        localResult.contactSheet,
+        localResult.mediaValidation,
+      );
+      const videoUrl = URL.createObjectURL(localResult.video);
+      if (review.status === 'awaiting_user_retry') {
+        store.setGenerateHyperFramesProgress(100);
+        await refreshVersions(projectId, '成片已生成，验收未通过，等待你决定是否重试');
+        store.setPreviewUrl(videoUrl);
+        store.setStep('result');
+        await refreshChat(projectId);
+        return;
+      }
+      store.setGenerateHyperFramesProgress(100);
+      await refreshVersions(projectId, '浏览器渲染与视觉验收完成，MP4 仅保留在当前设备');
+      store.setPreviewUrl(videoUrl);
+    } catch (error) {
+      if (!isBrowserEnvironmentError(error) && autoRepairAttempt < 3) {
+        const message = error instanceof Error ? error.message : '本机没有生成可播放视频';
+        const nextAttempt = autoRepairAttempt + 1;
+        store.setStep('generate');
+        store.setTaskText(`本机未生成可播放视频，正在自动修复工程 ${nextAttempt}/3`);
+        store.addChatMessage({
+          id: newClientId(),
+          role: 'agent',
+          text: `本机没有生成可播放视频，正在自动进行第 ${nextAttempt}/3 次工程修复。原因：${message}`,
+          timestamp: Date.now(),
+        });
+        const repairJob = await api.reportLocalRenderFailure(projectId, versionId, message, nextAttempt);
+        watchJob(
+          repairJob.id,
+          async (completedJob) => {
+            const result = completedJob.result;
+            if (result?.render_target === 'local' && result.version_id && result.bundle_url) {
+              await completeLocalRender(projectId, result.version_id, result.bundle_url, result.fps || fps, nextAttempt);
+              return;
+            }
+            await refreshVersions(projectId, '自动修复工程已完成');
+          },
+          async () => {
+            await refreshChat(projectId);
+          },
+        );
+        return;
+      }
+      throw error;
+    }
+  }, [refreshChat, refreshVersions, store, watchJob]);
+
+  const retryFailedRender = useCallback(async (versionId: string) => {
+    const projectId = store.projectId;
+    if (!projectId || store.activeJobId) return;
+    store.setError(null);
+    store.setChatBusy(true);
+    store.setStep('generate');
+    store.setGenerateHyperFramesProgress(2);
+    store.setGenerateDraftProgress(0);
+    store.setTaskText('正在把验收问题反馈给提示词 AI');
+    try {
+      const job = await api.retryLocalRender(projectId, versionId);
+      await refreshChat(projectId);
+      watchJob(
+        job.id,
+        async (completedJob) => {
+          const result = completedJob.result;
+          if (result?.render_target === 'local' && result.version_id && result.bundle_url) {
+            await finishLocalRender(projectId, result.version_id, result.bundle_url, result.fps || store.frameRate);
+            return;
+          }
+          await refreshVersions(projectId, '重试工程已完成');
+        },
+        async () => {
+          store.setChatBusy(false);
+          await refreshChat(projectId);
+        },
+      );
+    } catch (error) {
+      store.setChatBusy(false);
+      store.setStep('result');
+      store.setError(error instanceof Error ? error.message : '重试任务未能启动');
+    }
+  }, [finishLocalRender, refreshChat, refreshVersions, store, watchJob]);
+
+  const runChatAction = useCallback(async (action: string, versionId: string, messageId: string) => {
+    const projectId = store.projectId;
+    if (!projectId || store.activeJobId) return;
+    const isFineTune = action === 'fine_tune_video';
+    const isRegenerate = action === 'regenerate_video';
+    if (!isFineTune && !isRegenerate) return;
+    store.setError(null);
+    store.setChatBusy(true);
+    store.setStep('generate');
+    store.setGenerateHyperFramesProgress(2);
+    store.setGenerateDraftProgress(0);
+    store.setTaskText(isFineTune ? '对话 AI 正在微调当前工程' : '提示词 AI 正在重新规划全片');
+    try {
+      const job = isFineTune
+        ? await api.fineTuneFromChat(projectId, versionId, messageId)
+        : await api.regenerateFromChat(projectId, versionId, messageId);
+      await refreshChat(projectId);
+      watchJob(
+        job.id,
+        async (completedJob) => {
+          const result = completedJob.result;
+          if (result?.render_target === 'local' && result.version_id && result.bundle_url) {
+            await finishLocalRender(projectId, result.version_id, result.bundle_url, result.fps || store.frameRate);
+            return;
+          }
+          await refreshVersions(projectId, isFineTune ? '微调工程已完成' : '重新生成工程已完成');
+        },
+        async () => {
+          store.setChatBusy(false);
+          await refreshChat(projectId);
+        },
+      );
+    } catch (error) {
+      store.setChatBusy(false);
+      store.setStep('result');
+      store.setError(error instanceof Error ? error.message : '对话动作未能启动');
+    }
+  }, [finishLocalRender, refreshChat, refreshVersions, store, watchJob]);
 
   const startGenerate = useCallback(async () => {
     const projectId = store.projectId;
@@ -342,8 +492,16 @@ export function useStudioWorkflow() {
         ? '4K旗舰版'
         : '1080p';
     const pendingVersions = await api.listVersions(projectId);
+    const failed = pendingVersions.find((version) => version.status === 'local_render_failed');
+    if (failed) {
+      store.setCurrentVersionId(failed.id);
+      store.setStep('result');
+      store.setTaskText('上一版验收未通过，请在 Agent 对话中决定是否重试');
+      await refreshChat(projectId);
+      return;
+    }
     const pending = pendingVersions.find((version) =>
-      ['awaiting_local_render', 'local_render_failed', 'local_render_ready'].includes(version.status || '')
+      ['awaiting_local_render', 'local_render_ready'].includes(version.status || '')
     );
     if (pending?.local_render_bundle_url) {
       try {
@@ -354,8 +512,8 @@ export function useStudioWorkflow() {
           pending.render_fps || store.frameRate,
         );
       } catch (error) {
-        store.setError(error instanceof Error ? error.message : '本地渲染未完成');
-        store.setTaskText('等待用户电脑本地渲染');
+        store.setError(error instanceof Error ? error.message : '浏览器渲染未完成');
+        store.setTaskText('浏览器渲染需要重试');
       }
       return;
     }
@@ -363,8 +521,8 @@ export function useStudioWorkflow() {
     try {
       await checkLocalRenderer();
     } catch (error) {
-      store.setError(error instanceof Error ? error.message : '无法连接本地 Renderer');
-      store.setTaskText('等待本地 Renderer 授权或启动');
+      store.setError(error instanceof Error ? error.message : '当前浏览器不支持本地渲染');
+      store.setTaskText('当前浏览器无法编码 MP4');
       return;
     }
 
@@ -380,12 +538,12 @@ export function useStudioWorkflow() {
             result.fps || store.frameRate,
           );
         } catch (error) {
-          store.setError(error instanceof Error ? error.message : '本地渲染未完成');
-          store.setTaskText('等待用户电脑本地渲染');
+          store.setError(error instanceof Error ? error.message : '浏览器渲染未完成');
+          store.setTaskText('浏览器渲染需要重试');
           store.addChatMessage({
-            id: crypto.randomUUID(),
+            id: newClientId(),
             role: 'agent',
-            text: '云端视频设计已经完成，当前正在等待用户电脑上的 FrameCraft Renderer。启动本地 Renderer 后再次点击生成即可继续，不会重新调用 Agent。',
+            text: '视频工程已经完成，但当前浏览器没有完成本地 MP4 编码。使用最新版 Chrome 或 Edge 再次点击生成即可继续，不会重新调用 Agent。',
             timestamp: Date.now(),
           });
         }
@@ -393,7 +551,7 @@ export function useStudioWorkflow() {
       }
       await refreshVersions(projectId, '生成完成');
     });
-  }, [finishLocalRender, refreshVersions, store, watchJob]);
+  }, [finishLocalRender, refreshChat, refreshVersions, store, watchJob]);
 
   // 发送消息给当前项目自己的 Agent：可问答，也可直接改片并生成新版本。
   const sendChat = useCallback(
@@ -402,7 +560,7 @@ export function useStudioWorkflow() {
       if (!text) return;
       if (store.activeJobId) {
         store.addChatMessage({
-          id: crypto.randomUUID(),
+          id: newClientId(),
           role: 'agent',
           text: '当前项目已有 agent 任务在运行，请等它完成后再发送新的修改。',
           timestamp: Date.now(),
@@ -410,22 +568,20 @@ export function useStudioWorkflow() {
         return;
       }
       store.setChatBusy(true);
-      store.setTaskText('正在准备 Agent 对话');
-      store.addChatMessage({ id: crypto.randomUUID(), role: 'user', text, timestamp: Date.now() });
+      store.setTaskText('正在准备对话 AI');
+      store.addChatMessage({ id: newClientId(), role: 'user', text, timestamp: Date.now() });
       store.addChatMessage({
-        id: crypto.randomUUID(),
+        id: newClientId(),
         role: 'agent',
-        text: '已收到你的消息，正在连接当前项目的 Agent。后续处理过程会直接显示在这里。',
+        text: '已收到你的消息，正在读取当前项目工程并判断修改方式。',
         timestamp: Date.now(),
       });
       try {
-        const projectId = store.projectId || await ensureProject();
-        const url = new URL(window.location.href);
-        if (!url.searchParams.get('project')) {
-          url.searchParams.set('project', projectId);
-          window.history.replaceState(null, '', url.toString());
+        const projectId = store.projectId;
+        if (!projectId) {
+          throw new Error('当前工作台没有绑定项目，请先新建项目');
         }
-        store.setTaskText('Agent 正在处理对话');
+        store.setTaskText('对话 AI 正在处理消息');
         const res = await api.chat(projectId, text, true);
         store.addChatMessage({
           id: res.id,
@@ -433,6 +589,8 @@ export function useStudioWorkflow() {
           text: res.content,
           timestamp: Date.now(),
           patch: res.patch,
+          action: res.action,
+          versionId: res.version_id,
         });
         if (res.status === 'proposed' && res.patch) {
           store.setPendingPatch(res.patch);
@@ -450,8 +608,8 @@ export function useStudioWorkflow() {
                   store.setStep('generate');
                   await finishLocalRender(projectId, result.version_id, result.bundle_url, result.fps || store.frameRate);
                 } catch (error) {
-                  store.setError(error instanceof Error ? error.message : '本地渲染未完成');
-                  store.setTaskText('等待用户电脑本地渲染');
+                  store.setError(error instanceof Error ? error.message : '浏览器渲染未完成');
+                  store.setTaskText('浏览器渲染需要重试');
                 }
                 return;
               }
@@ -463,7 +621,7 @@ export function useStudioWorkflow() {
                 await refreshChat(projectId).catch(() => {
                   if (job.status === 'failed') {
                     store.addChatMessage({
-                      id: crypto.randomUUID(),
+                      id: newClientId(),
                       role: 'agent',
                       text: `对话任务未完成：${job.error_message || '请查看上方 Agent 日志。'}`,
                       timestamp: Date.now(),
@@ -479,15 +637,16 @@ export function useStudioWorkflow() {
       } catch (e) {
         store.setChatBusy(false);
         const msg = e instanceof Error ? e.message : '未知错误';
+        store.setError(msg);
         store.addChatMessage({
-          id: crypto.randomUUID(),
+          id: newClientId(),
           role: 'agent',
-          text: `对话请求失败：${msg}\n\n请确认新版后端已启动，并且 DeepSeek API Key 配置正确。`,
+          text: `这条消息未能提交：${msg}\n\n消息已保留在对话中，你可以稍后重试。`,
           timestamp: Date.now(),
         });
       }
     },
-    [ensureProject, finishLocalRender, refreshChat, refreshVersions, store, watchJob]
+    [finishLocalRender, refreshChat, refreshVersions, store, watchJob]
   );
 
   const saveScriptText = useCallback(async (text: string) => {
@@ -507,15 +666,15 @@ export function useStudioWorkflow() {
     store.setGenerateHyperFramesProgress(0);
     store.setGenerateDraftProgress(0);
     const job = await api.applyPatch(projectId, patch);
-    store.addChatMessage({ id: crypto.randomUUID(), role: 'agent', text: '已接受修改，正在重新生成科普视频预览…', timestamp: Date.now() });
+    store.addChatMessage({ id: newClientId(), role: 'agent', text: '已接受修改，正在重新生成科普视频预览…', timestamp: Date.now() });
     watchJob(job.id, async (completedJob) => {
       const result = completedJob.result;
       if (result?.render_target === 'local' && result.version_id && result.bundle_url) {
         try {
           await finishLocalRender(projectId, result.version_id, result.bundle_url, result.fps || store.frameRate);
         } catch (error) {
-          store.setError(error instanceof Error ? error.message : '本地渲染未完成');
-          store.setTaskText('等待用户电脑本地渲染');
+          store.setError(error instanceof Error ? error.message : '浏览器渲染未完成');
+          store.setTaskText('浏览器渲染需要重试');
         }
         return;
       }
@@ -526,7 +685,7 @@ export function useStudioWorkflow() {
   // 撤销/放弃当前修改方案
   const discardPatch = useCallback(() => {
     store.setPendingPatch(null);
-    store.addChatMessage({ id: crypto.randomUUID(), role: 'agent', text: '已撤销该修改方案，未做任何改动。', timestamp: Date.now() });
+    store.addChatMessage({ id: newClientId(), role: 'agent', text: '已撤销该修改方案，未做任何改动。', timestamp: Date.now() });
   }, [store]);
 
   // 回退到上一个版本（撤销已应用的修改）
@@ -541,7 +700,7 @@ export function useStudioWorkflow() {
     store.setCurrentVersionId(target.id);
     store.setVersion(`v${target.version_number}.0`);
     store.setPreviewUrl(null);
-    store.addChatMessage({ id: crypto.randomUUID(), role: 'agent', text: `已撤销到上一版本 v${target.version_number}.0。`, timestamp: Date.now() });
+    store.addChatMessage({ id: newClientId(), role: 'agent', text: `已撤销到上一版本 v${target.version_number}.0。`, timestamp: Date.now() });
   }, [store]);
 
   return {
@@ -551,9 +710,11 @@ export function useStudioWorkflow() {
     startAnalyze,
     startGenerate,
     sendChat,
+    runChatAction,
     acceptPatch,
     discardPatch,
     revertToPreviousVersion,
+    retryFailedRender,
     saveScriptText,
     refreshAssets,
     persistAsset,

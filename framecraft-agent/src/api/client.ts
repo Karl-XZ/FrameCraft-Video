@@ -1,91 +1,11 @@
 const viteBase = import.meta.env.BASE_URL === '/' ? '' : import.meta.env.BASE_URL.replace(/\/$/, '');
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? viteBase;
-const TOKEN_STORAGE_KEY = 'framecraft_access_token';
-let volatileAccessToken = '';
-
-function getStorage(): Storage | null {
-  if (typeof window === 'undefined') return null;
-  try {
-    if (!('localStorage' in window) || !window.localStorage) return null;
-    const probeKey = '__framecraft_storage_probe__';
-    window.localStorage.setItem(probeKey, '1');
-    window.localStorage.removeItem(probeKey);
-    return window.localStorage;
-  } catch {
-    return null;
-  }
-}
-
-function persistAccessToken(token: string) {
-  volatileAccessToken = token.trim();
-  const storage = getStorage();
-  if (!storage || !volatileAccessToken) return;
-  try {
-    storage.setItem(TOKEN_STORAGE_KEY, volatileAccessToken);
-  } catch {
-    /* ignore storage write errors */
-  }
-}
-
-function readAccessToken() {
-  if (typeof window === 'undefined') return '';
-  const url = new URL(window.location.href);
-  const fromUrl = url.searchParams.get('access_token') || url.searchParams.get('framecraft_token');
-  if (fromUrl) {
-    persistAccessToken(fromUrl);
-    url.searchParams.delete('access_token');
-    url.searchParams.delete('framecraft_token');
-    window.history.replaceState(null, '', url.toString());
-    return fromUrl;
-  }
-  if (volatileAccessToken) return volatileAccessToken;
-  const storage = getStorage();
-  if (!storage) return '';
-  try {
-    return storage.getItem(TOKEN_STORAGE_KEY) || '';
-  } catch {
-    return '';
-  }
-}
-
-function requestAccessToken() {
-  const existing = readAccessToken();
-  if (existing || typeof window === 'undefined') return existing;
-  const token = window.prompt('请输入 FrameCraft 访问口令');
-  if (token?.trim()) {
-    persistAccessToken(token);
-    return token.trim();
-  }
-  return '';
-}
-
-function authHeaders(headers?: HeadersInit) {
-  const merged = new Headers(headers);
-  const token = readAccessToken();
-  if (token) merged.set('X-FrameCraft-Token', token);
-  return merged;
-}
-
-async function authFetch(input: string, options?: RequestInit, retry = true): Promise<Response> {
-  const res = await fetch(input, {
-    ...options,
-    headers: authHeaders(options?.headers),
-  });
-  if (res.status === 401 && retry) {
-    const token = requestAccessToken();
-    if (token) return authFetch(input, options, false);
-  }
-  return res;
+async function authFetch(input: string, options?: RequestInit): Promise<Response> {
+  return fetch(input, options);
 }
 
 function urlWithAccessToken(path: string) {
-  const base = `${API_BASE}${path}`;
-  const token = readAccessToken();
-  if (!token) return base;
-  const url = new URL(base, window.location.origin);
-  url.searchParams.set('access_token', token);
-  if (API_BASE) return url.toString();
-  return `${url.pathname}${url.search}${url.hash}`;
+  return `${API_BASE}${path}`;
 }
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
@@ -165,6 +85,9 @@ export interface BackendChatMessage {
   created_at: string;
   patch?: Record<string, unknown>;
   status?: string;
+  action?: string | null;
+  version_id?: string;
+  action_payload?: Record<string, unknown>;
 }
 
 export interface ModelProviderMeta {
@@ -220,6 +143,16 @@ export interface BackendVersion {
   local_render_bundle_url?: string | null;
   render_fps?: number;
   expected_duration_s?: number;
+}
+
+export interface LocalRenderReviewResult {
+  ok?: boolean;
+  status?: string;
+  review?: Record<string, unknown>;
+  revision_scene_numbers?: number[];
+  job?: BackendJob;
+  id?: string;
+  version_id?: string;
 }
 
 export interface CreateProjectBody {
@@ -315,8 +248,34 @@ export const api = {
       { method: 'POST', body: form },
     );
     if (!response.ok) throw new Error(await response.text());
-    return response.json() as Promise<BackendVersion>;
+    return response.json() as Promise<LocalRenderReviewResult>;
   },
+  retryLocalRender: (projectId: string, versionId: string) =>
+    request<BackendJob>(`/api/projects/${projectId}/versions/${versionId}/retry`, { method: 'POST' }),
+  regenerateFromChat: (projectId: string, versionId: string, messageId?: string) =>
+    request<BackendJob>(`/api/projects/${projectId}/versions/${versionId}/regenerate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message_id: messageId || null }),
+    }),
+  fineTuneFromChat: (projectId: string, versionId: string, messageId?: string) =>
+    request<BackendJob>(`/api/projects/${projectId}/versions/${versionId}/fine-tune`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message_id: messageId || null }),
+    }),
+  reportLocalRenderFailure: (
+    projectId: string,
+    versionId: string,
+    error: string,
+    attempt: number,
+    mediaValidation: Record<string, unknown> = {},
+  ) =>
+    request<BackendJob>(`/api/projects/${projectId}/versions/${versionId}/local-render-failed`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ error, attempt, media_validation: mediaValidation }),
+    }),
   applyPatch: (projectId: string, patch: Record<string, unknown>) =>
     request<BackendJob>(`/api/projects/${projectId}/apply-patch`, {
       method: 'POST',
@@ -326,7 +285,6 @@ export const api = {
   cancelJob: (jobId: string) => request(`/api/jobs/${jobId}/cancel`, { method: 'POST' }),
   getImportGuide: (projectId: string, versionId: string) =>
     request<{ content: string }>(`/api/projects/${projectId}/versions/${versionId}/import-guide`),
-  getModelProviders: () => request<Record<string, unknown>>('/api/model-providers'),
   getJob: (jobId: string) => request<BackendJob>(`/api/jobs/${jobId}`),
   getActiveJob: (projectId: string) => request<BackendJob | null>(`/api/projects/${projectId}/jobs/active`),
   watchJob: (jobId: string, onEvent: (job: BackendJob) => void) => {
@@ -340,7 +298,16 @@ export const api = {
   },
   listVersions: (projectId: string) => request<BackendVersion[]>(`/api/projects/${projectId}/versions`),
   chat: (projectId: string, message: string, apply = true) =>
-    request<{ id: string; role: string; content: string; patch?: Record<string, unknown>; job_id?: string; status?: string }>(
+    request<{
+      id: string;
+      role: string;
+      content: string;
+      patch?: Record<string, unknown>;
+      job_id?: string;
+      status?: string;
+      action?: string | null;
+      version_id?: string;
+    }>(
       `/api/projects/${projectId}/chat`,
       { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ message, apply }) }
     ),
@@ -351,13 +318,6 @@ export const api = {
     ),
   getChat: (projectId: string) =>
     request<BackendChatMessage[]>(`/api/projects/${projectId}/chat`),
-  getSettings: () => request<Record<string, string>>('/api/settings/model'),
-  saveSettings: (body: Record<string, string>) =>
-    request('/api/settings/model', {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    }),
   fileUrl: (path: string) => urlWithAccessToken(path),
 };
 
