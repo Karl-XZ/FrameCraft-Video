@@ -181,6 +181,8 @@ def create_project(body: ProjectIn):
 
 @app.get("/api/projects")
 def list_projects():
+    if os.getenv("FRAMECRAFT_ALLOW_PROJECT_LIST", "").strip().lower() not in {"1", "true", "yes", "on"}:
+        raise HTTPException(404, "项目列表不可用，请通过项目专属链接访问。")
     data = store.snapshot()
     projects = list(data["projects"].values())
     projects.sort(key=lambda p: p.get("updated_at") or "", reverse=True)

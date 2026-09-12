@@ -191,7 +191,6 @@ export const api = {
     }),
   getProject: (projectId: string) => request<BackendProject>(`/api/projects/${projectId}`),
   deleteProject: (projectId: string) => request(`/api/projects/${projectId}`, { method: 'DELETE' }),
-  listProjects: () => request<BackendProject[]>('/api/projects'),
   listAssets: (projectId: string) => request<BackendAsset[]>(`/api/projects/${projectId}/assets`),
   getScript: (projectId: string) => request<{ text: string }>(`/api/projects/${projectId}/script`),
   putScript: (projectId: string, text: string) =>

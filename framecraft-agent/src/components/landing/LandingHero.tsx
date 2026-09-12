@@ -37,12 +37,6 @@ export default function LandingHero() {
               {badge}
             </span>
           ))}
-          <Link
-            to="/projects"
-            className="ml-2 px-4 py-1.5 rounded-full text-xs font-semibold bg-white/5 border border-white/10 text-text-secondary hover:text-text-main hover:bg-white/[0.08] transition-colors"
-          >
-            项目列表
-          </Link>
         </div>
       </nav>
 

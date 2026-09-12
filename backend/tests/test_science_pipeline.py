@@ -53,6 +53,15 @@ def generated_scene_code(number: int, shape: str = "orbit") -> dict[str, str]:
 
 
 class SciencePipelineTests(unittest.TestCase):
+    def test_project_list_api_is_private_by_default(self):
+        from fastapi.testclient import TestClient
+
+        from backend.app.main import app
+
+        with patch.dict("os.environ", {"FRAMECRAFT_ALLOW_PROJECT_LIST": ""}, clear=False):
+            response = TestClient(app).get("/api/projects")
+        self.assertEqual(response.status_code, 404)
+
     def test_chat_before_first_render_asks_for_initial_generation(self):
         state = {
             "projects": {"p1": {"id": "p1", "name": "测试"}},

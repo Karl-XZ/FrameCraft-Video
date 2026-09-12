@@ -114,7 +114,41 @@ interface ProjectState {
   setActiveJobId: (id: string | null) => void;
 }
 
-export const useProjectStore = create<ProjectState>((set) => ({
+type ProgressKey = 'overallProgress' | 'planProgress' | 'generateHyperFramesProgress' | 'generateDraftProgress';
+
+const progressTimers: Partial<Record<ProgressKey, ReturnType<typeof setInterval>>> = {};
+
+function clampProgress(value: number) {
+  return Math.max(0, Math.min(100, Math.round(Number.isFinite(value) ? value : 0)));
+}
+
+export const useProjectStore = create<ProjectState>((set, get) => {
+  const setSmoothProgress = (key: ProgressKey, value: number) => {
+    const target = clampProgress(value);
+    const current = clampProgress(get()[key]);
+    if (progressTimers[key]) {
+      clearInterval(progressTimers[key]);
+      progressTimers[key] = undefined;
+    }
+    if (target <= current || target === 0 || Math.abs(target - current) <= 1) {
+      set({ [key]: target } as Pick<ProjectState, ProgressKey>);
+      return;
+    }
+    const startedAt = Date.now();
+    const durationMs = Math.min(5200, Math.max(900, (target - current) * 65));
+    progressTimers[key] = setInterval(() => {
+      const t = Math.min(1, (Date.now() - startedAt) / durationMs);
+      const eased = 1 - Math.pow(1 - t, 3);
+      const next = Math.min(target, Math.round(current + (target - current) * eased));
+      set({ [key]: next } as Pick<ProjectState, ProgressKey>);
+      if (t >= 1 || next >= target) {
+        if (progressTimers[key]) clearInterval(progressTimers[key]);
+        progressTimers[key] = undefined;
+      }
+    }, 80);
+  };
+
+  return ({
   projectId: null,
   step: 'upload',
   demoMode: false,
@@ -180,15 +214,15 @@ export const useProjectStore = create<ProjectState>((set) => ({
   setGenerateDraft: (v) => set({ generateDraft: v }),
   setKeepHyperframes: (v) => set({ keepHyperframes: v }),
   setDraftTarget: (v) => set({ draftTarget: v }),
-  setOverallProgress: (v) => set({ overallProgress: v }),
+  setOverallProgress: (v) => setSmoothProgress('overallProgress', v),
   setCurrentAnalyzeTask: (v) => set({ currentAnalyzeTask: v }),
   setAnalyzeCompletedSteps: (v) => set({ analyzeCompletedSteps: v }),
   setAnalyzeLogs: (v) => set({ analyzeLogs: v }),
   setJobWarnings: (v) => set({ jobWarnings: v }),
-  setPlanProgress: (v) => set({ planProgress: v }),
+  setPlanProgress: (v) => setSmoothProgress('planProgress', v),
   setPlanSubstep: (v) => set({ planSubstep: v }),
-  setGenerateHyperFramesProgress: (v) => set({ generateHyperFramesProgress: v }),
-  setGenerateDraftProgress: (v) => set({ generateDraftProgress: v }),
+  setGenerateHyperFramesProgress: (v) => setSmoothProgress('generateHyperFramesProgress', v),
+  setGenerateDraftProgress: (v) => setSmoothProgress('generateDraftProgress', v),
   setTaskText: (v) => set({ taskText: v }),
   setVersion: (v) => set({ version: v }),
   setEditPlan: (p) => set({ editPlan: p }),
@@ -199,4 +233,5 @@ export const useProjectStore = create<ProjectState>((set) => ({
   setError: (e) => set({ error: e }),
   setChatBusy: (v) => set({ chatBusy: v }),
   setActiveJobId: (id) => set({ activeJobId: id }),
-}));
+  });
+});

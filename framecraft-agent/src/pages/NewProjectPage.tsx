@@ -82,8 +82,8 @@ export default function NewProjectPage() {
             <span className="text-text-main"> Agent</span>
           </span>
         </Link>
-        <Link to="/projects" className="flex items-center gap-2 text-sm text-text-secondary hover:text-text-main transition-colors">
-          <ArrowLeft className="w-4 h-4" /> 项目列表
+        <Link to="/" className="flex items-center gap-2 text-sm text-text-secondary hover:text-text-main transition-colors">
+          <ArrowLeft className="w-4 h-4" /> 返回首页
         </Link>
       </nav>
 
