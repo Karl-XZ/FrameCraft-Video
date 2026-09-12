@@ -84,6 +84,8 @@ def prepare_source_bundle(project_id: str) -> PreparedSource:
     source_dir.mkdir(parents=True, exist_ok=True)
 
     input_mode = str(project.get("input_mode") or ("script" if read_script_text(project) else "media"))
+    if input_mode == "topic" and project.get("script_user_edited") and read_script_text(project):
+        return prepare_script_source(project_id, project, source_dir, read_script_text(project))
     if input_mode == "topic":
         return prepare_topic_source(project_id, project, source_dir)
     if input_mode == "script":
@@ -128,6 +130,7 @@ def prepare_topic_source(project_id: str, project: dict[str, Any], source_dir: P
     def save_script(data):
         if project_id in data["projects"]:
             data["projects"][project_id]["script_text"] = script_text
+            data["projects"][project_id]["script_user_edited"] = False
     store.mutate(save_script)
     return _prepare_synthesized_source(project_id, project, source_dir, script_text, segments, "topic")
 

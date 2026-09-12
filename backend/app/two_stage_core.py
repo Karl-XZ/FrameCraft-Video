@@ -126,6 +126,96 @@ def materialize_two_stage_version(
     return {"duration_s":float(plan["project"]["total_duration_s"]),"scene_count":len(plan["pages"]),"caption_count":len(cues),"scene_code_count":len(plan["pages"]),"plan":plan}
 
 
+def materialize_two_stage_scene_repair(
+    project: dict[str, Any],
+    prepared: Any,
+    base_version_dir: Path,
+    version_dir: Path,
+    hyperframes_dir: Path,
+    audio_asset_name: str,
+    scene_number: int,
+    repair_feedback: dict[str, Any],
+    progress: Callable[[int, str], None] | None = None,
+) -> dict[str, Any]:
+    trace_path = base_version_dir / "two_stage_trace.json"
+    if not trace_path.is_file():
+        raise RuntimeError("基准版本缺少 two_stage_trace.json，无法只重画单幕。")
+    trace = json.loads(trace_path.read_text(encoding="utf-8"))
+    plan = parse_json_object((trace.get("prompt_ai") or {}).get("raw") or "{}")
+    pages = plan.get("pages") or []
+    if scene_number < 1 or scene_number > len(pages):
+        raise RuntimeError(f"单幕修复目标超出范围：第 {scene_number} 幕。")
+    width, height = _dimensions(str(project.get("aspect_ratio") or "9:16"))
+    duration = round(sum(float(item.get("duration_s") or 0) for item in pages), 3)
+    plan["project"] = {
+        **(plan.get("project") or {}),
+        "width": width,
+        "height": height,
+        "total_duration_s": duration,
+        "language": "简体中文",
+    }
+    for page in pages:
+        page.pop("source_label", None)
+
+    target_page = dict(pages[scene_number - 1])
+    system = (PROMPTS / "animation_ai_system.md").read_text(encoding="utf-8") + """
+
+现在执行单幕修复：只重画输入 page 对应这一幕。你必须彻底修复 repair_feedback 指出的问题，尤其是黑屏、空白、裁切、元素缺失、动画幅度不足或三帧近乎静止。其他幕不会重画，所以本幕需保持全片配色连续，但 DOM、SVG 路径、布局和动画节奏必须针对问题重新设计，不要只改文字、颜色或局部坐标。
+"""
+    if progress:
+        progress(46, f"动画 AI 正在只重画第 {scene_number} 幕")
+    raw, animation_trace = _call(
+        system,
+        {"project": plan["project"], "page": target_page, "repair_feedback": repair_feedback},
+        14000,
+    )
+    raw = re.sub(r"^```(?:html)?\s*|\s*```$", "", raw, flags=re.I | re.S).strip()
+    pid = str(target_page["page_id"])
+    if f'<template id="{pid}-template">' not in raw or f'data-composition-id="{pid}"' not in raw or f"window.__timelines['{pid}']" not in raw or "<!doctype" in raw.lower():
+        raise RuntimeError(f"动画 AI 返回的第 {scene_number} 幕不符合 HyperFrames 子 composition 契约。")
+
+    comp_dir = hyperframes_dir / "compositions"
+    comp_dir.mkdir(parents=True, exist_ok=True)
+    (comp_dir / f"{pid}.html").write_text(raw + "\n", encoding="utf-8")
+    words = normalize_words(json.loads(Path(prepared.transcript_path).read_text(encoding="utf-8")))
+    cues = build_subtitle_cues(words)
+    (comp_dir / "captions.html").write_text(_caption_template(cues, width, height, duration), encoding="utf-8")
+    (hyperframes_dir / "index.html").write_text(_host(plan, audio_asset_name, cues), encoding="utf-8")
+    timeline = {
+        "project_id": project.get("id"),
+        "total_duration": duration,
+        "scenes": [
+            {
+                "scene_number": i,
+                "scene_id": p["page_id"],
+                "start_time": round(sum(float(x["duration_s"]) for x in pages[: i - 1]), 3),
+                "end_time": round(sum(float(x["duration_s"]) for x in pages[:i]), 3),
+                "duration": p["duration_s"],
+                "headline": p.get("title"),
+                "semantic_motion": p.get("visual_concept"),
+            }
+            for i, p in enumerate(pages, 1)
+        ],
+        "captions": cues,
+    }
+    (version_dir / "timeline.json").write_text(json.dumps(timeline, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    trace["single_scene_repair"] = {
+        "scene_number": scene_number,
+        "page_id": pid,
+        "repair_feedback": repair_feedback,
+        "animation_ai": {"page_id": pid, "raw": raw, **animation_trace},
+    }
+    (version_dir / "two_stage_trace.json").write_text(json.dumps(trace, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return {
+        "duration_s": duration,
+        "scene_count": len(pages),
+        "caption_count": len(cues),
+        "scene_code_count": 1,
+        "plan": plan,
+        "repaired_scene_number": scene_number,
+    }
+
+
 def build_two_stage_analysis(project: dict[str, Any], prepared: Any) -> dict[str, Any]:
     plan, trace = create_plan(project, prepared)
     words = normalize_words(json.loads(Path(prepared.transcript_path).read_text(encoding="utf-8")))

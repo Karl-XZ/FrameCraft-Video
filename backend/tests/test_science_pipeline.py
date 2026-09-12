@@ -14,7 +14,7 @@ from backend.app.agent_scene_code import scene_code_fingerprint, validate_scene_
 from backend.app.ingest import build_audio_scene_seed, build_subtitle_cues, concatenate_audio, infer_semantic_motion, segment_script_for_tts
 from backend.app.jiuwen_team import normalize_creative_plan
 from backend.app.managed_faceless_builder import apply_creative_plan, render_agent_scene_markup, render_semantic_science_markup
-from backend.app.single_agent import SingleAgentRunner
+from backend.app.single_agent import SingleAgentRunner, _scene_numbers_from_payload
 from backend.app.two_stage_core import _caption_template, _host
 
 
@@ -145,6 +145,54 @@ class SciencePipelineTests(unittest.TestCase):
             self.assertEqual(message["version_id"], "v001")
             self.assertIn("hyperframes_files", sent_payload["context"])
             self.assertIn("字幕", sent_payload["context"]["hyperframes_files"][0]["preview"])
+
+    @patch("backend.app.single_agent.deepseek_settings", return_value={"text_model": "deepseek-v4-flash"})
+    @patch("backend.app.single_agent.create_client")
+    def test_dialogue_ai_proposes_single_scene_repair_action(self, client: Mock, _settings: Mock):
+        with tempfile.TemporaryDirectory() as temp:
+            version_dir = Path(temp) / "v001"
+            hf_dir = version_dir / "hyperframes" / "compositions"
+            hf_dir.mkdir(parents=True)
+            (hf_dir / "page-03.html").write_text("<div>第三幕</div>", encoding="utf-8")
+            (version_dir / "timeline.json").write_text(json.dumps({"scenes": [{"scene_number": 3}]}), encoding="utf-8")
+            client.return_value.chat.completions.create.return_value = SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps({
+                    "intent": "scene_repair",
+                    "reply": "可以只重画第 3 幕，其他幕保持不变。点击“单幕修复”开始。",
+                    "button_label": "单幕修复",
+                    "edit_summary": "第 3 幕黑屏，重新设计主视觉和运动。",
+                    "target_scene_numbers": [3],
+                    "target_files_hint": ["hyperframes/compositions/page-03.html"],
+                }, ensure_ascii=False)))]
+            )
+            state = {
+                "projects": {"p1": {"id": "p1", "name": "测试", "status": "ready_to_render"}},
+                "versions": {
+                    "v001": {
+                        "id": "v001", "project_id": "p1", "version_dir": str(version_dir),
+                        "status": "local_render_ready", "version_number": 1,
+                    }
+                },
+                "chat": {"p1": []},
+                "settings": store.default_db()["settings"],
+            }
+
+            def mutate(operation):
+                return operation(state)
+
+            runner = SingleAgentRunner()
+            with (
+                patch.object(store, "snapshot", side_effect=lambda: deepcopy(state)),
+                patch.object(store, "mutate", side_effect=mutate),
+            ):
+                message = runner.propose_chat_action("p1", "第 3 幕是黑的，重新做这一幕")
+
+            self.assertEqual(message["action"], "scene_repair_video")
+            self.assertEqual(message["action_payload"]["target_scene_numbers"], [3])
+            self.assertIn("单幕修复", message["content"])
+
+    def test_scene_numbers_parse_chinese_scene_reference(self):
+        self.assertEqual(_scene_numbers_from_payload(None, "请修复第 三 幕和第5页"), [3, 5])
 
     def test_regenerate_from_chat_passes_dialogue_summary_to_prompt_ai_job(self):
         state = {

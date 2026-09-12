@@ -11,6 +11,14 @@ import { useProjectStore, type Asset } from '../store/projectStore';
 import { checkLocalRenderer, renderLocally } from '../api/localRenderer';
 
 const TERMINAL_JOB_STATUSES = ['completed', 'failed', 'cancelled', 'needs_input'];
+const GUIDED_PROGRESS_DURATION_MS = 90_000;
+type GuidedProgressKey = 'overallProgress' | 'planProgress' | 'generateHyperFramesProgress' | 'generateDraftProgress';
+type GuidedProgressEntry = {
+  timer: ReturnType<typeof setInterval>;
+  startedAt: number;
+  last: number;
+  seed: number;
+};
 
 function newClientId() {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
@@ -36,10 +44,94 @@ function isBrowserEnvironmentError(error: unknown) {
   return /HTTPS|Chrome|Edge|浏览器不支持|当前设备无法|安全连接|编码/.test(message);
 }
 
+function wait(ms: number) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
 export function useStudioWorkflow() {
   const store = useProjectStore();
   const jobEsRef = useRef<EventSource | null>(null);
   const jobLogCountsRef = useRef<Record<string, number>>({});
+  const guidedProgressRef = useRef<Partial<Record<GuidedProgressKey, GuidedProgressEntry>>>({});
+
+  const setProgressValue = useCallback((key: GuidedProgressKey, value: number) => {
+    if (key === 'overallProgress') store.setOverallProgress(value);
+    if (key === 'planProgress') store.setPlanProgress(value);
+    if (key === 'generateHyperFramesProgress') store.setGenerateHyperFramesProgress(value);
+    if (key === 'generateDraftProgress') store.setGenerateDraftProgress(value);
+  }, [store]);
+
+  const stopGuidedProgress = useCallback((keys?: GuidedProgressKey[]) => {
+    const targets = keys || (Object.keys(guidedProgressRef.current) as GuidedProgressKey[]);
+    targets.forEach((key) => {
+      const entry = guidedProgressRef.current[key];
+      if (entry) window.clearInterval(entry.timer);
+      delete guidedProgressRef.current[key];
+    });
+  }, []);
+
+  const startGuidedProgress = useCallback((keys: GuidedProgressKey[], initial = 0) => {
+    keys.forEach((key) => {
+      if (guidedProgressRef.current[key]) return;
+      const seed = Math.random() * 1000;
+      const startedAt = Date.now();
+      const entry: GuidedProgressEntry = {
+        timer: window.setInterval(() => {
+          const active = guidedProgressRef.current[key];
+          if (!active) return;
+          const elapsed = Date.now() - active.startedAt;
+          const t = Math.min(1, elapsed / GUIDED_PROGRESS_DURATION_MS);
+          const wave = Math.sin(t * Math.PI * 7 + active.seed) * 1.5;
+          const grain = Math.random() * 0.9;
+          const target = t >= 1 ? 80 : Math.min(79, 80 * t + wave + grain);
+          const next = Math.max(active.last, Math.round(target));
+          active.last = next;
+          setProgressValue(key, next);
+          if (t >= 1) {
+            window.clearInterval(active.timer);
+            delete guidedProgressRef.current[key];
+          }
+        }, 850),
+        startedAt,
+        last: Math.max(0, Math.min(80, Math.round(initial))),
+        seed,
+      };
+      guidedProgressRef.current[key] = entry;
+      setProgressValue(key, entry.last);
+    });
+  }, [setProgressValue]);
+
+  const setGuidedOrRealProgress = useCallback((key: GuidedProgressKey, realProgress: number) => {
+    const value = Math.max(0, Math.min(100, Math.round(realProgress)));
+    const entry = guidedProgressRef.current[key];
+    if (!entry) {
+      setProgressValue(key, value);
+      return;
+    }
+    const elapsed = Date.now() - entry.startedAt;
+    if (value < 100 && elapsed < GUIDED_PROGRESS_DURATION_MS) return;
+    window.clearInterval(entry.timer);
+    delete guidedProgressRef.current[key];
+    setProgressValue(key, value < 100 ? Math.max(80, value) : value);
+  }, [setProgressValue]);
+
+  const finishGuidedProgress = useCallback(async (keys: GuidedProgressKey[]) => {
+    stopGuidedProgress(keys);
+    keys.forEach((key) => setProgressValue(key, 100));
+    await wait(1000);
+  }, [setProgressValue, stopGuidedProgress]);
+
+  const failGuidedProgress = useCallback((keys?: GuidedProgressKey[]) => {
+    stopGuidedProgress(keys);
+  }, [stopGuidedProgress]);
+
+  const guidedKeysForJob = useCallback((job: BackendJob): GuidedProgressKey[] => {
+    if (job.type === 'analyze') return ['overallProgress', 'planProgress'];
+    if (['generate', 'apply_patch', 'fine_tune', 'scene_repair'].includes(job.type)) {
+      return ['generateHyperFramesProgress', 'generateDraftProgress'];
+    }
+    return [];
+  }, []);
 
   const ensureProject = useCallback(async () => {
     if (store.projectId) return store.projectId;
@@ -204,18 +296,18 @@ export function useStudioWorkflow() {
           jobLogCountsRef.current[job.id] = logs.length;
         }
         if (job.type === 'analyze' || store.step === 'analyze') {
-          store.setOverallProgress(Math.round(job.progress));
+          setGuidedOrRealProgress('overallProgress', Math.round(job.progress));
           store.setCurrentAnalyzeTask(job.current_step || '处理中');
           if (job.completed_steps) store.setAnalyzeCompletedSteps(job.completed_steps);
           if (job.logs) store.setAnalyzeLogs(job.logs);
           if (job.warnings?.length) store.setJobWarnings(job.warnings);
-          if (typeof job.plan_progress === 'number') store.setPlanProgress(job.plan_progress);
+          if (typeof job.plan_progress === 'number') setGuidedOrRealProgress('planProgress', job.plan_progress);
           store.setPlanSubstep(job.plan_substep ?? null);
         }
-        if (job.type === 'generate' || store.step === 'generate') {
+        if (['generate', 'apply_patch', 'fine_tune', 'scene_repair'].includes(job.type) || store.step === 'generate') {
           const p = Math.round(job.progress);
-          store.setGenerateHyperFramesProgress(Math.min(100, p));
-          store.setGenerateDraftProgress(Math.min(100, Math.max(0, p - 10)));
+          setGuidedOrRealProgress('generateHyperFramesProgress', Math.min(100, p));
+          setGuidedOrRealProgress('generateDraftProgress', Math.min(100, Math.max(0, p - 10)));
         }
         if (job.status === 'failed') {
           store.setError(job.error_message || '任务失败');
@@ -225,17 +317,28 @@ export function useStudioWorkflow() {
           store.setError(null);
         }
         if (job.status === 'completed') {
-          void Promise.resolve(onDone?.(job)).catch((e) => {
+          const deferToLocalRender = Boolean(job.result?.render_target === 'local' && job.result.version_id && job.result.bundle_url);
+          void (async () => {
+            if (!deferToLocalRender) {
+              await finishGuidedProgress(guidedKeysForJob(job));
+            }
+            await onDone?.(job);
+          })().catch((e) => {
             store.setError(e instanceof Error ? e.message : '任务完成后的刷新失败');
           });
         }
         if (TERMINAL_JOB_STATUSES.includes(job.status)) {
+          jobEsRef.current?.close();
+          jobEsRef.current = null;
           store.setActiveJobId(null);
+          if (job.status !== 'completed') {
+            failGuidedProgress(guidedKeysForJob(job));
+          }
           void Promise.resolve(onTerminal?.(job)).catch(() => undefined);
         }
       });
     },
-    [store]
+    [failGuidedProgress, finishGuidedProgress, guidedKeysForJob, setGuidedOrRealProgress, store]
   );
 
   const loadProjectWithActiveJob = useCallback(async (projectId: string) => {
@@ -246,10 +349,12 @@ export function useStudioWorkflow() {
     if (active.type === 'analyze') {
       store.setStep('analyze');
       store.setOverallProgress(Math.round(active.progress));
-    } else if (active.type === 'generate' || active.type === 'apply_patch') {
+      startGuidedProgress(['overallProgress', 'planProgress'], Math.round(active.progress));
+    } else if (['generate', 'apply_patch', 'fine_tune', 'scene_repair'].includes(active.type)) {
       store.setStep('generate');
       store.setGenerateHyperFramesProgress(Math.round(active.progress));
       store.setGenerateDraftProgress(Math.max(0, Math.round(active.progress) - 10));
+      startGuidedProgress(['generateHyperFramesProgress', 'generateDraftProgress'], Math.round(active.progress));
     } else if (active.type === 'chat') {
       store.setChatBusy(true);
     }
@@ -259,6 +364,8 @@ export function useStudioWorkflow() {
       async (job) => {
         if (job.type === 'analyze') {
           const plan = await api.getEditPlan(projectId);
+          const freshProject = await api.getProject(projectId);
+          if (typeof freshProject.script_text === 'string') store.setScriptText(freshProject.script_text);
           store.setEditPlan(plan);
           store.setStep('plan');
           store.setTaskText('分析完成，请确认剪辑方案');
@@ -274,7 +381,7 @@ export function useStudioWorkflow() {
         if (job.type === 'chat') store.setChatBusy(false);
       },
     );
-  }, [loadProject, refreshAssets, refreshChat, refreshVersions, store, watchJob]);
+  }, [loadProject, refreshAssets, refreshChat, refreshVersions, startGuidedProgress, store, watchJob]);
 
   const startAnalyze = useCallback(async () => {
     store.setError(null);
@@ -307,11 +414,14 @@ export function useStudioWorkflow() {
       store.setJobWarnings([]);
       store.setPlanProgress(0);
       store.setPlanSubstep(null);
+      startGuidedProgress(['overallProgress', 'planProgress'], 1);
       const job = await api.analyze(projectId);
       watchJob(
         job.id,
         async () => {
           const plan = await api.getEditPlan(projectId);
+          const freshProject = await api.getProject(projectId);
+          if (typeof freshProject.script_text === 'string') store.setScriptText(freshProject.script_text);
           store.setEditPlan(plan);
           store.setStep('plan');
           store.setTaskText('分析完成，请确认视频方案');
@@ -324,11 +434,12 @@ export function useStudioWorkflow() {
         },
       );
     } catch (error) {
+      failGuidedProgress(['overallProgress', 'planProgress']);
       store.setStep('upload');
       store.setTaskText('Agent 分析未启动');
       store.setError(error instanceof Error ? error.message : '启动科普方案失败，请稍后重试');
     }
-  }, [refreshAssets, refreshChat, store, watchJob]);
+  }, [failGuidedProgress, refreshAssets, refreshChat, startGuidedProgress, store, watchJob]);
 
   const persistAsset = useCallback(async (assetId: string, body: Record<string, unknown>) => {
     await api.updateAsset(assetId, body);
@@ -343,15 +454,19 @@ export function useStudioWorkflow() {
     autoRepairAttempt = 0,
   ) {
     try {
+      startGuidedProgress(['generateHyperFramesProgress', 'generateDraftProgress'], store.generateHyperFramesProgress || 2);
       store.setTaskText('正在浏览器内准备 HyperFrames 工程');
-      store.setGenerateHyperFramesProgress(86);
+      setGuidedOrRealProgress('generateHyperFramesProgress', 86);
+      setGuidedOrRealProgress('generateDraftProgress', 76);
       const bundle = await api.downloadLocalRenderBundle(bundleUrl);
       const localResult = await renderLocally(bundle, fps, (progress, step) => {
         store.setTaskText(step);
-        store.setGenerateHyperFramesProgress(Math.min(98, 86 + Math.round(progress * 0.12)));
+        setGuidedOrRealProgress('generateHyperFramesProgress', Math.min(98, 86 + Math.round(progress * 0.12)));
+        setGuidedOrRealProgress('generateDraftProgress', Math.min(95, 76 + Math.round(progress * 0.18)));
       });
       store.setTaskText('正在提交逐幕联系表进行视觉验收');
-      store.setGenerateHyperFramesProgress(99);
+      setGuidedOrRealProgress('generateHyperFramesProgress', 99);
+      setGuidedOrRealProgress('generateDraftProgress', 98);
       const review = await api.reviewLocalRender(
         projectId,
         versionId,
@@ -360,22 +475,24 @@ export function useStudioWorkflow() {
       );
       const videoUrl = URL.createObjectURL(localResult.video);
       if (review.status === 'awaiting_user_retry') {
-        store.setGenerateHyperFramesProgress(100);
+        await finishGuidedProgress(['generateHyperFramesProgress', 'generateDraftProgress']);
         await refreshVersions(projectId, '成片已生成，严格验收发现可能问题，等待你决定是否重试');
         store.setPreviewUrl(videoUrl);
         store.setStep('result');
         await refreshChat(projectId);
         return;
       }
-      store.setGenerateHyperFramesProgress(100);
+      await finishGuidedProgress(['generateHyperFramesProgress', 'generateDraftProgress']);
       await refreshVersions(projectId, '浏览器渲染与视觉验收完成，MP4 仅保留在当前设备');
       store.setPreviewUrl(videoUrl);
     } catch (error) {
+      failGuidedProgress(['generateHyperFramesProgress', 'generateDraftProgress']);
       if (!isBrowserEnvironmentError(error) && autoRepairAttempt < 3) {
         const message = error instanceof Error ? error.message : '本机没有生成可播放视频';
         const nextAttempt = autoRepairAttempt + 1;
         store.setStep('generate');
         store.setTaskText(`本机未生成可播放视频，正在自动修复工程 ${nextAttempt}/3`);
+        startGuidedProgress(['generateHyperFramesProgress', 'generateDraftProgress'], store.generateHyperFramesProgress || 2);
         store.addChatMessage({
           id: newClientId(),
           role: 'agent',
@@ -401,7 +518,7 @@ export function useStudioWorkflow() {
       }
       throw error;
     }
-  }, [refreshChat, refreshVersions, store, watchJob]);
+  }, [failGuidedProgress, finishGuidedProgress, refreshChat, refreshVersions, setGuidedOrRealProgress, startGuidedProgress, store, watchJob]);
 
   const retryFailedRender = useCallback(async (versionId: string) => {
     const projectId = store.projectId;
@@ -411,6 +528,7 @@ export function useStudioWorkflow() {
     store.setStep('generate');
     store.setGenerateHyperFramesProgress(2);
     store.setGenerateDraftProgress(0);
+    startGuidedProgress(['generateHyperFramesProgress', 'generateDraftProgress'], 2);
     store.setTaskText('正在把验收问题反馈给提示词 AI');
     try {
       const job = await api.retryLocalRender(projectId, versionId);
@@ -431,27 +549,38 @@ export function useStudioWorkflow() {
         },
       );
     } catch (error) {
+      failGuidedProgress(['generateHyperFramesProgress', 'generateDraftProgress']);
       store.setChatBusy(false);
       store.setStep('result');
       store.setError(error instanceof Error ? error.message : '重试任务未能启动');
     }
-  }, [finishLocalRender, refreshChat, refreshVersions, store, watchJob]);
+  }, [failGuidedProgress, finishLocalRender, refreshChat, refreshVersions, startGuidedProgress, store, watchJob]);
 
   const runChatAction = useCallback(async (action: string, versionId: string, messageId: string) => {
     const projectId = store.projectId;
     if (!projectId || store.activeJobId) return;
     const isFineTune = action === 'fine_tune_video';
     const isRegenerate = action === 'regenerate_video';
-    if (!isFineTune && !isRegenerate) return;
+    const isSceneRepair = action === 'scene_repair_video';
+    if (!isFineTune && !isRegenerate && !isSceneRepair) return;
     store.setError(null);
     store.setChatBusy(true);
     store.setStep('generate');
     store.setGenerateHyperFramesProgress(2);
     store.setGenerateDraftProgress(0);
-    store.setTaskText(isFineTune ? '对话 AI 正在微调当前工程' : '提示词 AI 正在重新规划全片');
+    startGuidedProgress(['generateHyperFramesProgress', 'generateDraftProgress'], 2);
+    store.setTaskText(
+      isSceneRepair
+        ? '动画 AI 正在单幕修复'
+        : isFineTune
+          ? '对话 AI 正在微调当前工程'
+          : '提示词 AI 正在重新规划全片',
+    );
     try {
       const job = isFineTune
         ? await api.fineTuneFromChat(projectId, versionId, messageId)
+        : isSceneRepair
+          ? await api.sceneRepairFromChat(projectId, versionId, messageId)
         : await api.regenerateFromChat(projectId, versionId, messageId);
       await refreshChat(projectId);
       watchJob(
@@ -462,7 +591,7 @@ export function useStudioWorkflow() {
             await finishLocalRender(projectId, result.version_id, result.bundle_url, result.fps || store.frameRate);
             return;
           }
-          await refreshVersions(projectId, isFineTune ? '微调工程已完成' : '重新生成工程已完成');
+          await refreshVersions(projectId, isSceneRepair ? '单幕修复工程已完成' : isFineTune ? '微调工程已完成' : '重新生成工程已完成');
         },
         async () => {
           store.setChatBusy(false);
@@ -470,11 +599,12 @@ export function useStudioWorkflow() {
         },
       );
     } catch (error) {
+      failGuidedProgress(['generateHyperFramesProgress', 'generateDraftProgress']);
       store.setChatBusy(false);
       store.setStep('result');
       store.setError(error instanceof Error ? error.message : '对话动作未能启动');
     }
-  }, [finishLocalRender, refreshChat, refreshVersions, store, watchJob]);
+  }, [failGuidedProgress, finishLocalRender, refreshChat, refreshVersions, startGuidedProgress, store, watchJob]);
 
   const startGenerate = useCallback(async () => {
     const projectId = store.projectId;
@@ -486,6 +616,7 @@ export function useStudioWorkflow() {
     store.setStep('generate');
     store.setGenerateHyperFramesProgress(0);
     store.setGenerateDraftProgress(0);
+    startGuidedProgress(['generateHyperFramesProgress', 'generateDraftProgress'], 1);
     const resolution = store.videoResolution.startsWith('720')
       ? '720p'
       : store.videoResolution.startsWith('4K')
@@ -494,6 +625,7 @@ export function useStudioWorkflow() {
     const pendingVersions = await api.listVersions(projectId);
     const failed = pendingVersions.find((version) => version.status === 'local_render_failed');
     if (failed) {
+      failGuidedProgress(['generateHyperFramesProgress', 'generateDraftProgress']);
       store.setCurrentVersionId(failed.id);
       store.setStep('result');
       store.setTaskText('上一版严格验收发现可能问题，请在 Agent 对话中决定是否重试');
@@ -521,6 +653,7 @@ export function useStudioWorkflow() {
     try {
       await checkLocalRenderer();
     } catch (error) {
+      failGuidedProgress(['generateHyperFramesProgress', 'generateDraftProgress']);
       store.setError(error instanceof Error ? error.message : '当前浏览器不支持本地渲染');
       store.setTaskText('当前浏览器无法编码 MP4');
       return;
@@ -551,7 +684,7 @@ export function useStudioWorkflow() {
       }
       await refreshVersions(projectId, '生成完成');
     });
-  }, [finishLocalRender, refreshChat, refreshVersions, store, watchJob]);
+  }, [failGuidedProgress, finishLocalRender, refreshChat, refreshVersions, startGuidedProgress, store, watchJob]);
 
   // 发送消息给当前项目自己的 Agent：可问答，也可直接改片并生成新版本。
   const sendChat = useCallback(
@@ -568,20 +701,14 @@ export function useStudioWorkflow() {
         return;
       }
       store.setChatBusy(true);
-      store.setTaskText('正在准备对话 AI');
+      store.setTaskText('正在思考');
       store.addChatMessage({ id: newClientId(), role: 'user', text, timestamp: Date.now() });
-      store.addChatMessage({
-        id: newClientId(),
-        role: 'agent',
-        text: '已收到你的消息，正在读取当前项目工程并判断修改方式。',
-        timestamp: Date.now(),
-      });
       try {
         const projectId = store.projectId;
         if (!projectId) {
           throw new Error('当前工作台没有绑定项目，请先新建项目');
         }
-        store.setTaskText('对话 AI 正在处理消息');
+        store.setTaskText('正在思考');
         const res = await api.chat(projectId, text, true);
         store.addChatMessage({
           id: res.id,
@@ -665,6 +792,7 @@ export function useStudioWorkflow() {
     store.setStep('generate');
     store.setGenerateHyperFramesProgress(0);
     store.setGenerateDraftProgress(0);
+    startGuidedProgress(['generateHyperFramesProgress', 'generateDraftProgress'], 1);
     const job = await api.applyPatch(projectId, patch);
     store.addChatMessage({ id: newClientId(), role: 'agent', text: '已接受修改，正在重新生成科普视频预览…', timestamp: Date.now() });
     watchJob(job.id, async (completedJob) => {
@@ -680,7 +808,7 @@ export function useStudioWorkflow() {
       }
       await refreshVersions(projectId, '修改已应用并重新生成');
     });
-  }, [finishLocalRender, refreshVersions, store, watchJob]);
+  }, [finishLocalRender, refreshVersions, startGuidedProgress, store, watchJob]);
 
   // 撤销/放弃当前修改方案
   const discardPatch = useCallback(() => {

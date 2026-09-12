@@ -268,6 +268,7 @@ def put_script(project_id: str, body: ScriptIn):
         if not project:
             raise HTTPException(404, "Project not found")
         project["script_text"] = text
+        project["script_user_edited"] = True
         project["updated_at"] = store.now_iso()
         return project
 
@@ -564,6 +565,17 @@ def fine_tune_from_chat(project_id: str, version_id: str, body: ChatActionIn):
     _version(project_id, version_id)
     try:
         return runner.fine_tune_from_chat(project_id, version_id, body.message_id)
+    except ProjectBusyError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.post("/api/projects/{project_id}/versions/{version_id}/scene-repair")
+def scene_repair_from_chat(project_id: str, version_id: str, body: ChatActionIn):
+    _version(project_id, version_id)
+    try:
+        return runner.scene_repair_from_chat(project_id, version_id, body.message_id)
     except ProjectBusyError as exc:
         raise HTTPException(409, str(exc)) from exc
     except RuntimeError as exc:

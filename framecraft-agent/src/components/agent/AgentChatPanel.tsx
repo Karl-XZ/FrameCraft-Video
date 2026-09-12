@@ -15,6 +15,7 @@ function actionLabel(action?: string | null) {
   if (action === 'retry_render') return '重试';
   if (action === 'regenerate_video') return '重新生成';
   if (action === 'fine_tune_video') return '微调';
+  if (action === 'scene_repair_video') return '单幕修复';
   return undefined;
 }
 
@@ -90,7 +91,7 @@ export default function AgentChatPanel() {
                 actionDisabled={busy}
                 onAction={msg.versionId && msg.action === 'retry_render'
                   ? () => void retryFailedRender(msg.versionId as string)
-                  : msg.versionId && (msg.action === 'regenerate_video' || msg.action === 'fine_tune_video')
+                  : msg.versionId && (msg.action === 'regenerate_video' || msg.action === 'fine_tune_video' || msg.action === 'scene_repair_video')
                     ? () => void runChatAction(msg.action as string, msg.versionId as string, msg.id)
                     : undefined}
               />

@@ -135,7 +135,7 @@ export const useProjectStore = create<ProjectState>((set, get) => {
       return;
     }
     const startedAt = Date.now();
-    const durationMs = Math.min(5200, Math.max(900, (target - current) * 65));
+    const durationMs = target >= 100 ? 1000 : Math.min(5200, Math.max(900, (target - current) * 65));
     progressTimers[key] = setInterval(() => {
       const t = Math.min(1, (Date.now() - startedAt) / durationMs);
       const eased = 1 - Math.pow(1 - t, 3);

@@ -262,6 +262,12 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ message_id: messageId || null }),
     }),
+  sceneRepairFromChat: (projectId: string, versionId: string, messageId?: string) =>
+    request<BackendJob>(`/api/projects/${projectId}/versions/${versionId}/scene-repair`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message_id: messageId || null }),
+    }),
   reportLocalRenderFailure: (
     projectId: string,
     versionId: string,

@@ -16,7 +16,7 @@ from . import store
 from .ingest import PreparedSource, ensure_version_subtitles, prepare_source_bundle
 from .deepseek_api import create_client, deepseek_available, deepseek_settings, parse_json_object
 from .jiuwen_team import run_visual_review
-from .two_stage_core import build_two_stage_analysis, materialize_two_stage_version
+from .two_stage_core import build_two_stage_analysis, materialize_two_stage_scene_repair, materialize_two_stage_version
 
 TERMINAL_STATUSES = {"completed", "failed", "cancelled", "needs_input"}
 HYPERFRAMES_ROOT = store.ROOT.parent / "hyperframes"
@@ -124,6 +124,8 @@ class SingleAgentRunner:
                 self._run_managed_render(job_id, prepared)
             elif job["type"] == "fine_tune":
                 self._run_dialogue_fine_tune(job_id, prepared)
+            elif job["type"] == "scene_repair":
+                self._run_scene_repair(job_id, prepared)
             else:
                 self._run_agent_loop(job_id, prepared)
             if not self._validate_outputs(job_id):
@@ -231,14 +233,27 @@ class SingleAgentRunner:
         )
         decision = parse_json_object(response.choices[0].message.content)
         intent = str(decision.get("intent") or "answer").strip()
-        if intent not in {"answer", "regenerate", "fine_tune"}:
+        if intent not in {"answer", "regenerate", "scene_repair", "fine_tune"}:
             intent = "answer"
+        target_scene_numbers = _scene_numbers_from_payload(decision.get("target_scene_numbers"), message)
+        if intent == "scene_repair" and not target_scene_numbers:
+            reply = "我可以只重画某一幕，但需要先知道具体幕编号。请告诉我例如“修复第 3 幕”。"
+            return self._append_chat_action(project_id, reply, "chat", None, version["id"], {})
         reply = str(decision.get("reply") or "").strip() or "我已经读完当前工程上下文，可以继续帮你判断修改方式。"
-        action = "regenerate_video" if intent == "regenerate" else "fine_tune_video" if intent == "fine_tune" else None
+        action = (
+            "regenerate_video"
+            if intent == "regenerate"
+            else "scene_repair_video"
+            if intent == "scene_repair"
+            else "fine_tune_video"
+            if intent == "fine_tune"
+            else None
+        )
         payload = {
             "intent": intent,
             "user_message": message,
             "edit_summary": str(decision.get("edit_summary") or "").strip(),
+            "target_scene_numbers": target_scene_numbers,
             "target_files_hint": decision.get("target_files_hint") or [],
             "risk_note": str(decision.get("risk_note") or "").strip(),
             "base_version_id": version["id"],
@@ -1294,6 +1309,35 @@ class SingleAgentRunner:
         )
         return job
 
+    def scene_repair_from_chat(self, project_id: str, version_id: str, message_id: str | None = None) -> dict[str, Any]:
+        action_payload = self._find_chat_action_payload(project_id, version_id, message_id, "scene_repair_video")
+        version = store.snapshot()["versions"].get(version_id)
+        if not version or version.get("project_id") != project_id:
+            raise RuntimeError("待单幕修复的版本不存在。")
+        target_scene_numbers = _scene_numbers_from_payload(
+            action_payload.get("target_scene_numbers"),
+            action_payload.get("user_message"),
+        )
+        if not target_scene_numbers:
+            raise RuntimeError("单幕修复缺少明确幕编号。")
+        job = self.start(
+            project_id,
+            "scene_repair",
+            {
+                "fps": int(version.get("render_fps") or 24),
+                "base_version_id": version_id,
+                "scene_number": target_scene_numbers[0],
+                "chat_revision_request": action_payload,
+            },
+        )
+        self._consume_chat_action(project_id, version_id, message_id, "scene_repair_video")
+        self._append_action_started(
+            project_id,
+            job["id"],
+            f"已开始单幕修复。只重画第 {target_scene_numbers[0]} 幕，其他幕保持不变，完成后重新生成完整工程供浏览器渲染。",
+        )
+        return job
+
     def retry_unplayable_render(
         self,
         project_id: str,
@@ -1598,6 +1642,78 @@ class SingleAgentRunner:
             (
                 f"微调工程已完成，修改了 {len(applied)} 个文件：{', '.join(applied[:5])}。"
                 f"耗时 {time.perf_counter() - started:.1f} 秒，接下来由当前浏览器生成 MP4 并验收。"
+            ),
+            "awaiting_local_render",
+        )
+
+    def _run_scene_repair(self, job_id: str, prepared: PreparedSource) -> None:
+        snapshot = store.snapshot()
+        job = snapshot["jobs"][job_id]
+        project_id = job["project_id"]
+        project = snapshot["projects"].get(project_id) or {}
+        payload = job.get("payload") or {}
+        base_version_id = str(payload.get("base_version_id") or "")
+        base_version = snapshot["versions"].get(base_version_id)
+        if not base_version or base_version.get("project_id") != project_id:
+            raise RuntimeError("单幕修复缺少可读取的基准版本。")
+        scene_number = int(payload.get("scene_number") or 0)
+        if scene_number <= 0:
+            raise RuntimeError("单幕修复缺少明确幕编号。")
+        base_dir = Path(str(base_version.get("version_dir") or ""))
+        base_hf = base_dir / "hyperframes"
+        if not (base_hf / "index.html").is_file():
+            raise RuntimeError("基准版本缺少 HyperFrames 工程，无法单幕修复。")
+
+        self._set_step(job_id, 22, f"正在复制基准工程并准备第 {scene_number} 幕修复")
+        version_count = len([v for v in snapshot["versions"].values() if v["project_id"] == project_id])
+        created = self._tool_create_version_dir(job_id, f"v{version_count + 1:03d}")
+        version_dir = Path(str(created["version_dir"]))
+        hyperframes_dir = version_dir / "hyperframes"
+        shutil.copytree(base_hf, hyperframes_dir, dirs_exist_ok=True)
+        for name in ("subtitles.srt", "local_render_manifest.json"):
+            src = base_dir / name
+            if src.is_file():
+                shutil.copy2(src, version_dir / name)
+
+        assets_dir = version_dir / "assets"
+        assets_dir.mkdir(parents=True, exist_ok=True)
+        if not prepared.source_audio_path or not prepared.source_audio_path.is_file():
+            raise RuntimeError("缺少可渲染的旁白音频，无法修复单幕。")
+        audio_name = "source_audio" + prepared.source_audio_path.suffix.lower()
+        shutil.copy2(prepared.source_audio_path, assets_dir / audio_name)
+        (hyperframes_dir / "assets").mkdir(parents=True, exist_ok=True)
+        shutil.copy2(prepared.source_audio_path, hyperframes_dir / "assets" / audio_name)
+
+        request = payload.get("chat_revision_request") or {}
+        repair_feedback = {
+            "mode": "single_scene_repair",
+            "target_scene_number": scene_number,
+            "user_message": request.get("user_message"),
+            "dialogue_ai_summary": request.get("edit_summary"),
+            "risk_note": request.get("risk_note"),
+            "base_version_id": base_version_id,
+        }
+        summary = materialize_two_stage_scene_repair(
+            project=project,
+            prepared=prepared,
+            base_version_dir=base_dir,
+            version_dir=version_dir,
+            hyperframes_dir=hyperframes_dir,
+            audio_asset_name=audio_name,
+            scene_number=scene_number,
+            repair_feedback=repair_feedback,
+            progress=lambda progress, step: self._set_step(job_id, progress, step),
+        )
+        render_fps = max(15, min(int(payload.get("fps") or base_version.get("render_fps") or 24), 60))
+        self._set_step(job_id, 86, f"第 {scene_number} 幕已重画，等待当前浏览器重新渲染完整视频")
+        registered = self._tool_register_local_render(job_id, str(version_dir), render_fps)
+        if not registered.get("ok"):
+            raise RuntimeError("单幕修复工程注册失败。")
+        self._tool_write_chat(
+            job_id,
+            (
+                f"第 {summary['repaired_scene_number']} 幕已单独重画完成，其他幕保持不变。"
+                "请在当前浏览器重新渲染完整视频并查看验收结果。"
             ),
             "awaiting_local_render",
         )
@@ -2001,7 +2117,7 @@ class SingleAgentRunner:
                 self._fail(job_id, "分析任务没有生成 analysis.json 和 edit_plan.json。")
                 return False
             return True
-        if job["type"] in {"generate", "apply_patch", "fine_tune"}:
+        if job["type"] in {"generate", "apply_patch", "fine_tune", "scene_repair"}:
             local_result = job.get("result") or {}
             if local_result.get("render_target") == "local":
                 version = snapshot["versions"].get(str(local_result.get("version_id") or ""))
@@ -2179,6 +2295,39 @@ def _is_under(path: Path, root: Path) -> bool:
 
 def _trim(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[:limit] + "\n...[truncated]..."
+
+
+def _scene_numbers_from_payload(value: Any, fallback_text: Any = "") -> list[int]:
+    numbers: list[int] = []
+    if isinstance(value, list):
+        for item in value:
+            try:
+                number = int(item)
+            except (TypeError, ValueError):
+                continue
+            if number > 0:
+                numbers.append(number)
+    elif value is not None:
+        try:
+            number = int(value)
+            if number > 0:
+                numbers.append(number)
+        except (TypeError, ValueError):
+            pass
+    if not numbers:
+        text = str(fallback_text or "")
+        for raw in re.findall(r"第\s*([0-9一二三四五六七八九十]+)\s*(?:幕|页|场景)", text):
+            if raw.isdigit():
+                numbers.append(int(raw))
+                continue
+            cn_map = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
+            if raw in cn_map:
+                numbers.append(cn_map[raw])
+    deduped: list[int] = []
+    for number in numbers:
+        if number not in deduped:
+            deduped.append(number)
+    return deduped[:3]
 
 
 def _normalize_tool_arguments(raw: Any) -> str:

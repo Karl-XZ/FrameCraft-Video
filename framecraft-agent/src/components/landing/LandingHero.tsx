@@ -1,6 +1,6 @@
 import React from 'react';
 import { Link } from 'react-router-dom';
-import { Sparkles, Play } from 'lucide-react';
+import { Sparkles } from 'lucide-react';
 import DemoPreviewCard from './DemoPreviewCard';
 import FeatureCard from './FeatureCard';
 import ProcessFlow from './ProcessFlow';
@@ -69,13 +69,6 @@ export default function LandingHero() {
               >
                 <Zap className="w-4 h-4" />
                 开始生成科普视频
-              </Link>
-              <Link
-                to="/projects/new"
-                className="flex items-center gap-2 px-5 py-3.5 rounded-xl text-base font-semibold glass hover:bg-white/[0.08] transition-colors text-text-secondary hover:text-text-main border border-white/10"
-              >
-                <Play className="w-4 h-4" />
-                查看演示流程
               </Link>
             </div>
           </div>
