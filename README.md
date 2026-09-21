@@ -5,7 +5,7 @@
 **Multi-Agent Generative Science Animation Video Studio**  
 *Transform topics, manuscripts, and media files into dynamic motion-graphics videos via openJiuwen, DeepSeek, and HyperFrames.*
 
-[Bilibili Demo](https://www.bilibili.com/video/BV1Q6jC6QEPv/) • [Core Capabilities](#key-capabilities) • [Input Modes](#three-input-modes) • [Multi-Agent Architecture](#multi-agent-architecture) • [Quality Gates](#quality-gates--visual-verification) • [Local Setup](#local-development--deployment) • [Security & Privacy](#security-and-data-retention)
+[Live Demo](https://openl.work/FrameCraft) • [Bilibili Demo](https://www.bilibili.com/video/BV1Q6jC6QEPv/) • [Core Capabilities](#key-capabilities) • [Input Modes](#three-input-modes) • [Multi-Agent Architecture](#multi-agent-architecture) • [Quality Gates](#quality-gates--visual-verification) • [Local Setup](#local-development--deployment) • [Security & Privacy](#security-and-data-retention)
 
 </div>
 
